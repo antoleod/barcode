@@ -877,7 +877,7 @@ export default function App() {
   }
 
   async function clearAppCache() {
-    const ok = confirm("Clear this app cache and local app data?");
+    const ok = confirm("Clear this App cache and local app data?");
     if (!ok) return;
 
     try {
