@@ -1,5 +1,5 @@
-﻿import React, { useEffect, useMemo, useRef, useState } from "react";
-import { BrowserMultiFormatReader } from "@zxing/browser";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { BrowserMultiFormatReader, BarcodeFormat, DecodeHintType } from "@zxing/browser";
 import Quagga from "@ericblade/quagga2";
 import { saveAs } from "file-saver";
 import Tesseract from "tesseract.js";
@@ -76,11 +76,6 @@ function uniqueByRecent(rows, newValue, windowMs = 1200) {
   if (normalizeText(last.barcode) !== v) return true;
   const lastT = Number(last._ts || 0);
   return Date.now() - lastT > windowMs;
-}
-
-function wasAlreadyScanned(rows, value) {
-  const v = normalizeText(value);
-  return rows.some((r) => normalizeText(r.barcode) === v);
 }
 
 function clamp(value, min = 0, max = 255) {
@@ -488,20 +483,21 @@ export default function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null); // Internal canvas for processing
   const readerRef = useRef(null);
+  const workerRef = useRef(null);
+  const workerPromiseRef = useRef(null);
 
   const [rows, setRows] = useState(() => loadRows());
-  const [status, setStatus] = useState("Listo. Dale permiso a la cÃ¡mara y escanea.");
+  const [status, setStatus] = useState("Listo. Dale permiso a la cámara y escanea.");
   const [error, setError] = useState("");
   const [devices, setDevices] = useState([]);
   const [deviceId, setDeviceId] = useState("");
   const [torchSupported, setTorchSupported] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
-  const [scanMode] = useState("4"); 
+  const [scanMode, setScanMode] = useState("deep"); 
   const [autoCommit, setAutoCommit] = useState(true);
   const [manual, setManual] = useState("");
   const [cooldownMs, setCooldownMs] = useState(1200);
   const [processed, setProcessed] = useState(null);
-  const [duplicateBarcode, setDuplicateBarcode] = useState("");
   const [showSettings, setShowSettings] = useState(false);
   const [showFallbacks, setShowFallbacks] = useState(false);
   const [scanning, setScanning] = useState(false);
@@ -519,7 +515,20 @@ export default function App() {
   // Initialize ZXing Reader with Hints
   const getReader = () => {
     if (!readerRef.current) {
-      readerRef.current = new BrowserMultiFormatReader();
+      const hints = new Map();
+      const formats = [
+        BarcodeFormat.CODE_128,
+        BarcodeFormat.CODE_39,
+        BarcodeFormat.EAN_13,
+        BarcodeFormat.EAN_8,
+        BarcodeFormat.ITF,
+        BarcodeFormat.UPC_A,
+        BarcodeFormat.UPC_E,
+        BarcodeFormat.CODABAR
+      ];
+      hints.set(DecodeHintType.POSSIBLE_FORMATS, formats);
+      hints.set(DecodeHintType.TRY_HARDER, true);
+      readerRef.current = new BrowserMultiFormatReader(hints);
     }
     return readerRef.current;
   };
@@ -536,7 +545,7 @@ export default function App() {
         setDeviceId((back || list[0] || {}).deviceId || "");
       }
     } catch (e) {
-      setError(`No pude listar cÃ¡maras: ${e?.message || e}`);
+      setError(`No pude listar cámaras: ${e?.message || e}`);
     }
   }
 
@@ -575,7 +584,7 @@ export default function App() {
   async function startCamera() {
     await stopCamera();
     setError("");
-    setStatus("Iniciando cÃ¡mara...");
+    setStatus("Iniciando cámara...");
     setScanning(true);
     scanState.current.active = true;
     scanState.current.phaseStartTime = Date.now();
@@ -619,10 +628,10 @@ export default function App() {
         }
       }
 
-      setStatus("Buscando cÃ³digo...");
+      setStatus("Buscando código...");
     } catch (e) {
       console.error(e);
-      setError("Error al acceder a la cÃ¡mara. Verifica permisos.");
+      setError("Error al acceder a la cámara. Verifica permisos.");
       setScanning(false);
     }
   }
@@ -692,10 +701,20 @@ export default function App() {
     if (now - scanState.current.lastScanTime < 100) return; 
     scanState.current.lastScanTime = now;
 
-    const phase = 4;
-    if (scanPhase !== 4) {
-      setScanPhase(4);
-      setStatus("Modo 4 activo: busqueda profunda + OCR.");
+    // Determine Phase based on time since start without success
+    const elapsed = now - scanState.current.phaseStartTime;
+    let phase = 0;
+    if (elapsed > 2000) phase = 1; // After 2s, try harder
+    if (elapsed > 5000) phase = 2; // After 5s, preprocess
+    if (elapsed > 8000) phase = 3; // After 8s, deep scan
+    if (elapsed > 12000) phase = 4; // After 12s, desperate (OCR)
+    
+    if (phase !== scanPhase) {
+      setScanPhase(phase);
+      if (phase === 1) setStatus("Enfocando...");
+      if (phase === 2) setStatus("Ajustando contraste...");
+      if (phase === 3) setStatus("Probando inversión y filtros...");
+      if (phase === 4) setStatus("Intentando leer números (OCR)...");
     }
 
     // --- Pipeline ---
@@ -823,10 +842,9 @@ export default function App() {
     const cleanText = normalizeText(text);
     if (!isLikelyBarcode(cleanText)) return;
 
-    if (wasAlreadyScanned(rows, cleanText) || !uniqueByRecent(rows, cleanText, cooldownMs)) {
-      setDuplicateBarcode(cleanText);
-      setStatus(`Ya fue escaneado: ${cleanText}`);
-      if (navigator.vibrate) navigator.vibrate([180, 80, 180]);
+    // Debounce duplicate scans
+    if (!uniqueByRecent(rows, cleanText, cooldownMs)) {
+      // Visual feedback for duplicate scan?
       return;
     }
 
@@ -856,6 +874,9 @@ export default function App() {
   useEffect(() => {
     return () => {
       stopCamera();
+      if (workerRef.current) {
+        workerRef.current.terminate();
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -901,7 +922,7 @@ export default function App() {
   }
 
   function clearAll() {
-    if (!confirm("Â¿Seguro que quieres borrar todo el historial?") ) return;
+    if (!confirm("¿Seguro que quieres borrar todo el historial?") ) return;
     setRows([]);
     saveRows([]);
     setStatus("Historial borrado.");
@@ -910,13 +931,7 @@ export default function App() {
   function commitManual() {
     const v = normalizeText(manual);
     if (!isLikelyBarcode(v)) {
-      setError("CÃ³digo muy corto. Intenta de nuevo.");
-      return;
-    }
-    if (wasAlreadyScanned(rows, v)) {
-      setDuplicateBarcode(v);
-      setStatus(`Ya fue escaneado: ${v}`);
-      if (navigator.vibrate) navigator.vibrate([180, 80, 180]);
+      setError("Código muy corto. Intenta de nuevo.");
       return;
     }
     setRows((prev) => [
@@ -944,14 +959,26 @@ export default function App() {
     return { ok: false };
   }
 
-  async function tryOcr(canvas) {
-    try {
-      const worker = await Tesseract.createWorker("eng");
-      await worker.setParameters({
+  async function getOcrWorker() {
+    if (workerRef.current) return workerRef.current;
+    if (workerPromiseRef.current) return workerPromiseRef.current;
+
+    workerPromiseRef.current = (async () => {
+      const w = await Tesseract.createWorker("eng");
+      await w.setParameters({
         tessedit_char_whitelist: "0123456789",
       });
+      workerRef.current = w;
+      workerPromiseRef.current = null;
+      return w;
+    })();
+    return workerPromiseRef.current;
+  }
+
+  async function tryOcr(canvas) {
+    try {
+      const worker = await getOcrWorker();
       const { data: { text } } = await worker.recognize(canvas);
-      await worker.terminate();
 
       const matches = text.match(/\b\d{5,}\b/g);
       if (matches && matches.length > 0) {
@@ -995,7 +1022,7 @@ export default function App() {
           ]);
 
           if (!decoded.ok) {
-            setStatus("Barcode fallÃ³. Intentando leer nÃºmeros (OCR)...");
+            setStatus("Barcode falló. Intentando leer números (OCR)...");
             // Try OCR on the cleanest version (Version B)
             const ocrResult = await tryOcr(pack.versionB);
             if (ocrResult.ok) Object.assign(decoded, ocrResult);
@@ -1007,13 +1034,6 @@ export default function App() {
             return;
           }
 
-          if (wasAlreadyScanned(rows, decoded.text)) {
-            setDuplicateBarcode(decoded.text);
-            setStatus(`Ya fue escaneado: ${decoded.text}`);
-            if (navigator.vibrate) navigator.vibrate([180, 80, 180]);
-            return;
-          }
-
           setRows((prev) => [
             ...prev,
             { _ts: Date.now(), timestamp: nowIsoLocal(), barcode: decoded.text, format: decoded.format },
@@ -1021,7 +1041,7 @@ export default function App() {
           playSuccessSound();
           setStatus(`Detectado en ${decoded.pass}: ${decoded.text}`);
         } catch (e) {
-          setError(`No pude leer el cÃ³digo desde la imagen: ${e?.message || e}`);
+          setError(`No pude leer el código desde la imagen: ${e?.message || e}`);
         } finally {
           URL.revokeObjectURL(url);
         }
@@ -1083,7 +1103,7 @@ export default function App() {
 
           <div style={{ textAlign: 'center', marginTop: '1rem' }}>
             <button className="btn ghost small" style={{ fontSize: '0.85rem', padding: '4px 8px' }} onClick={() => setShowSettings(!showSettings)}>
-              {showSettings ? "Ocultar ConfiguraciÃ³n" : "ConfiguraciÃ³n (CÃ¡mara / Modo)"}
+              {showSettings ? "Ocultar Configuración" : "Configuración (Cámara / Modo)"}
             </button>
           </div>
 
@@ -1091,18 +1111,21 @@ export default function App() {
             <div style={{ background: 'rgba(0,0,0,0.03)', padding: '1rem', borderRadius: '8px', marginTop: '0.5rem' }}>
               <div className="row">
                 <label className="label">Modo</label>
-                <input className="input" value={`Opcion ${scanMode}`} disabled />
+                <select className="input" value={scanMode} onChange={(e) => setScanMode(e.target.value)}>
+                  <option value="deep">Deep Scan (reintentos 1-4)</option>
+                  <option value="fast">Fast (sin watchdog)</option>
+                </select>
               </div>
 
               <div className="row">
-                <label className="label">CÃ¡mara</label>
+                <label className="label">Cámara</label>
                 <select className="input" value={deviceId} onChange={(e) => setDeviceId(e.target.value)}>
                   {devices.length === 0 ? (
                     <option value="">(no detectada)</option>
                   ) : (
                     devices.map((d) => (
                       <option key={d.deviceId} value={d.deviceId}>
-                        {d.label || `Camera ${d.deviceId.slice(0, 6)}â€¦`}
+                        {d.label || `Camera ${d.deviceId.slice(0, 6)}…`}
                       </option>
                     ))
                   )}
@@ -1154,7 +1177,7 @@ export default function App() {
               <input
                 className="input"
                 value={manual}
-                placeholder="CÃ³digo..."
+                placeholder="Código..."
                 onChange={(e) => setManual(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") commitManual();
@@ -1205,7 +1228,6 @@ export default function App() {
                 </button>
               </div>
             </div>
-          )}
             </div>
           )}
 
@@ -1214,7 +1236,7 @@ export default function App() {
         <div className="card">
           <div className="cardHead">
             <h2>Tabla</h2>
-            <div className="muted">Cada lectura agrega una lÃ­nea nueva. Se guarda localmente.</div>
+            <div className="muted">Cada lectura agrega una línea nueva. Se guarda localmente.</div>
           </div>
 
           <div className="tableActions">
@@ -1233,13 +1255,10 @@ export default function App() {
               </thead>
               <tbody>
                 {orderedRows.length === 0 ? (
-                  <tr><td colSpan="4" className="muted">No hay lecturas aÃºn.</td></tr>
+                  <tr><td colSpan="4" className="muted">No hay lecturas aún.</td></tr>
                 ) : (
                   orderedRows.map((r, i) => (
-                    <tr
-                      key={`${r._ts}-${i}`}
-                      className={normalizeText(r.barcode) === normalizeText(duplicateBarcode) ? "duplicateRow" : ""}
-                    >
+                    <tr key={`${r._ts}-${i}`}>
                       <td>{orderedRows.length - i}</td>
                       <td className="mono">{r.timestamp}</td>
                       <td className="mono">{r.barcode}</td>
@@ -1252,7 +1271,7 @@ export default function App() {
           </div>
 
           <div className="note">
-            <strong>Excel:</strong> Exporta un .xlsx listo. Si quieres â€œllenar un Excel existenteâ€, puedes importar una plantilla
+            <strong>Excel:</strong> Exporta un .xlsx listo. Si quieres “llenar un Excel existente”, puedes importar una plantilla
             y exportar de nuevo (lo dejo listo para ampliar en <code>exportXlsx()</code>).
           </div>
         </div>
@@ -1266,4 +1285,3 @@ export default function App() {
     </div>
   );
 }
-
