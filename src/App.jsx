@@ -609,7 +609,9 @@ export default function App() {
     stream: null,
     track: null,
     ocrBusy: false,
-    lastOcrTime: 0
+    lastOcrTime: 0,
+    processing: false,
+    decodeCanvas: null
   });
 
   async function stopCamera() {
@@ -641,8 +643,9 @@ export default function App() {
         video: {
           deviceId: deviceId ? { exact: deviceId } : undefined,
           facingMode: deviceId ? undefined : { ideal: "environment" },
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
+          width: { ideal: 960 },
+          height: { ideal: 540 },
+          frameRate: { ideal: 24, max: 30 },
           focusMode: { ideal: "continuous" }
         }
       };
@@ -726,7 +729,7 @@ export default function App() {
     const diff = calculateFrameDiff(scanState.current.lastFrameData, currentFrameData);
     scanState.current.lastFrameData = currentFrameData;
 
-    if (diff > 25) { // Threshold for motion
+    if (diff > 38) { // Motion threshold tuned for hand-held devices
       scanState.current.consecutiveStableFrames = 0;
       // If moving too much, skip heavy decode, just wait
       requestAnimationFrame(scanLoop);
@@ -734,15 +737,31 @@ export default function App() {
     }
     scanState.current.consecutiveStableFrames++;
 
-    // Only decode if stable for a few frames (~100ms)
-    if (scanState.current.consecutiveStableFrames > 3) {
-      await attemptDecode(canvas, ctx);
+    // Non-blocking decode: copy frame snapshot and process async
+    if (scanState.current.consecutiveStableFrames > 1 && !scanState.current.processing) {
+      if (!scanState.current.decodeCanvas) {
+        scanState.current.decodeCanvas = document.createElement("canvas");
+      }
+      const snap = scanState.current.decodeCanvas;
+      if (snap.width !== canvas.width || snap.height !== canvas.height) {
+        snap.width = canvas.width;
+        snap.height = canvas.height;
+      }
+      const sctx = snap.getContext("2d", { willReadFrequently: true });
+      sctx.drawImage(canvas, 0, 0);
+
+      scanState.current.processing = true;
+      attemptDecode(snap)
+        .catch((e) => console.warn("Decode error", e))
+        .finally(() => {
+          scanState.current.processing = false;
+        });
     }
 
     requestAnimationFrame(scanLoop);
   }
 
-  async function attemptDecode(canvas, ctx) {
+  async function attemptDecode(canvas) {
     const now = Date.now();
     if (serialLocked) return;
     // Debounce scans
@@ -752,10 +771,10 @@ export default function App() {
     // Determine Phase based on time since start without success
     const elapsed = now - scanState.current.phaseStartTime;
     let phase = 0;
-    if (elapsed > 2000) phase = 1; // After 2s, try harder
-    if (elapsed > 5000) phase = 2; // After 5s, preprocess
-    if (elapsed > 8000) phase = 3; // After 8s, deep scan
-    if (elapsed > 12000) phase = 4; // After 12s, desperate (OCR)
+    if (elapsed > 500) phase = 1;
+    if (elapsed > 1500) phase = 2;
+    if (elapsed > 3000) phase = 3;
+    if (elapsed > 4500) phase = 4;
     
     if (phase !== scanPhase) {
       setScanPhase(phase);
@@ -766,7 +785,7 @@ export default function App() {
     }
 
     // OCR only on ROI under barcode bbox (no full-frame OCR)
-    if (phase >= 4 && !scanState.current.ocrBusy && (now - scanState.current.lastOcrTime > 1800 || !scanState.current.lastOcrTime)) {
+    if (phase >= 2 && !scanState.current.ocrBusy && (now - scanState.current.lastOcrTime > 1600 || !scanState.current.lastOcrTime)) {
       scanState.current.ocrBusy = true;
       scanState.current.lastOcrTime = now;
       
@@ -784,8 +803,8 @@ export default function App() {
     }
 
     // If we reach here in Phase 4 multiple times, show hint
-    if (phase === 4 && scanState.current.consecutiveStableFrames % 60 === 0) {
-      setStatus("Intenta acercar/alejar o mejorar la luz.");
+    if (phase >= 3 && scanState.current.consecutiveStableFrames % 50 === 0) {
+      setStatus("Adjust distance or lighting for better OCR.");
     }
   }
 
@@ -876,6 +895,7 @@ export default function App() {
       const w = await Tesseract.createWorker("eng");
       await w.setParameters({
         tessedit_char_whitelist: "02PI20ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        tessedit_pageseg_mode: "7",
       });
       workerRef.current = w;
       workerPromiseRef.current = null;
@@ -911,11 +931,53 @@ export default function App() {
     };
   }
 
+  function toDetectionCanvas(sourceCanvas, maxWidth = 960) {
+    const scale = Math.min(1, maxWidth / sourceCanvas.width);
+    const det = createCanvas(sourceCanvas.width * scale, sourceCanvas.height * scale);
+    const dctx = det.getContext("2d", { willReadFrequently: true });
+    dctx.drawImage(sourceCanvas, 0, 0, det.width, det.height);
+    return { det, scaleX: sourceCanvas.width / det.width, scaleY: sourceCanvas.height / det.height };
+  }
+
+  function scaleBBox(bbox, sx, sy) {
+    return {
+      x: bbox.x * sx,
+      y: bbox.y * sy,
+      width: bbox.width * sx,
+      height: bbox.height * sy,
+    };
+  }
+
+  function buildRoiCandidates(baseBbox, canvas) {
+    const main = buildSerialRoiBBox(baseBbox, canvas);
+    const wider = expandBBox(
+      { x: baseBbox.x, y: baseBbox.y + baseBbox.height, width: baseBbox.width, height: Math.max(24, baseBbox.height * 1.2) },
+      0.35,
+      0.12
+    );
+    const taller = {
+      x: main.x,
+      y: Math.max(0, main.y - baseBbox.height * 0.2),
+      width: main.width,
+      height: main.height * 1.35,
+    };
+    const centeredBottom = getCenteredFallbackBBox(canvas);
+
+    return [main, wider, taller, centeredBottom].map((b) => ({
+      x: clamp(b.x, 0, canvas.width - 1),
+      y: clamp(b.y, 0, canvas.height - 1),
+      width: clamp(b.width, 1, canvas.width - clamp(b.x, 0, canvas.width - 1)),
+      height: clamp(b.height, 1, canvas.height - clamp(b.y, 0, canvas.height - 1)),
+    }));
+  }
+
   async function detectBarcodeBBoxFromCanvas(frameCanvas) {
+    const { det, scaleX, scaleY } = toDetectionCanvas(frameCanvas, 960);
+
     try {
-      const result = await getReader().decodeFromCanvas(frameCanvas);
+      const result = await getReader().decodeFromCanvas(det);
       const bbox = getBBoxFromZXingResult(result?.getResultPoints?.());
-      if (bbox) return bbox;
+      if (bbox) return scaleBBox(bbox, scaleX, scaleY);
     } catch {
       // fallback to quagga
     }
@@ -924,7 +986,7 @@ export default function App() {
       const quaggaResult = await new Promise((resolve) => {
         Quagga.decodeSingle(
           {
-            src: frameCanvas.toDataURL("image/jpeg"),
+            src: det.toDataURL("image/jpeg"),
             numOfWorkers: 0,
             locate: true,
             decoder: { readers: ["code_128_reader", "ean_reader", "code_39_reader", "i2of5_reader"] },
@@ -936,12 +998,12 @@ export default function App() {
       if (quaggaResult?.box?.length) {
         const xs = quaggaResult.box.map((p) => p.x);
         const ys = quaggaResult.box.map((p) => p.y);
-        return {
+        return scaleBBox({
           x: Math.min(...xs),
           y: Math.min(...ys),
           width: Math.max(...xs) - Math.min(...xs),
           height: Math.max(...ys) - Math.min(...ys),
-        };
+        }, scaleX, scaleY);
       }
     } catch {
       // ignore and use centered fallback
@@ -959,22 +1021,25 @@ export default function App() {
     };
 
     try {
-      const roiBbox = buildSerialRoiBBox(bbox, frameCanvas);
-      const roiCanvas = cropCanvas(frameCanvas, roiBbox);
-      const pre = preprocessRoiCanvas(roiCanvas);
       const worker = await getOcrWorker();
+      const roiCandidates = buildRoiCandidates(bbox, frameCanvas);
 
-      const first = await worker.recognize(pre);
-      let serial = extractSerialFromText(first?.data?.text);
-      if (serial) {
-        return { success: true, serial, method: "ocr-roi", error: null };
-      }
+      for (const candidate of roiCandidates) {
+        const roiCanvas = cropCanvas(frameCanvas, candidate);
+        const pre = preprocessRoiCanvas(roiCanvas);
 
-      invertCanvas(pre);
-      const second = await worker.recognize(pre);
-      serial = extractSerialFromText(second?.data?.text);
-      if (serial) {
-        return { success: true, serial, method: "ocr-roi", error: null };
+        const first = await worker.recognize(pre);
+        let serial = extractSerialFromText(first?.data?.text);
+        if (serial) {
+          return { success: true, serial, method: "ocr-roi", error: null };
+        }
+
+        invertCanvas(pre);
+        const second = await worker.recognize(pre);
+        serial = extractSerialFromText(second?.data?.text);
+        if (serial) {
+          return { success: true, serial, method: "ocr-roi", error: null };
+        }
       }
 
       return { ...resultBase, error: "serial_not_found" };
