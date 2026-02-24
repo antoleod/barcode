@@ -1043,7 +1043,7 @@ export default function App() {
       </header>
 
       <section className="grid">
-        <div className="card">
+        <div className="card scanCard">
           <div className="cardHead">
             <h2>Scanner</h2>
             <div className="status">{status}</div>
@@ -1207,7 +1207,7 @@ export default function App() {
 
         </div>
 
-        <div className="card">
+        <div className="card listCard">
           <div className="cardHead">
             <h2>Tabla</h2>
             <div className="muted">Cada lectura agrega una lÃ­nea nueva. Se guarda localmente.</div>
