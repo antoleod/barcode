@@ -455,6 +455,8 @@ export default function App() {
   const [manual, setManual] = useState("");
   const [cooldownMs, setCooldownMs] = useState(1200);
   const [processed, setProcessed] = useState(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showFallbacks, setShowFallbacks] = useState(false);
 
   const count = rows.length;
 
@@ -474,8 +476,8 @@ export default function App() {
   async function refreshDevices() {
     setError("");
     try {
-      const reader = await ensureReader();
-      const list = await reader.listVideoInputDevices();
+      const allDevices = await navigator.mediaDevices.enumerateDevices();
+      const list = allDevices.filter((d) => d.kind === "videoinput");
       setDevices(list);
       if (!deviceId) {
         // Prefer back camera if possible
@@ -815,7 +817,7 @@ export default function App() {
       <header className="top">
         <div>
           <h1>Barcode to Excel</h1>
-          <div className="sub">Escanea con la cámara y exporta a .xlsx (sin servidor). Robusto con “Deep Scan”.</div>
+          <div className="sub">Escanea y exporta a .xlsx.</div>
         </div>
         <div className="right">
           <div className="pill">Total: <strong>{count}</strong></div>
@@ -830,83 +832,100 @@ export default function App() {
             <div className="status">{status}</div>
           </div>
 
-          <div className="controls">
-            <button className="btn" onClick={() => startCamera({ attempt: 1 })}>Iniciar</button>
-            <button className="btn ghost" onClick={stopCamera}>Detener</button>
-            <button className="btn ghost" onClick={refreshDevices}>Camaras</button>
-          </div>
-
-          <div className="row">
-            <label className="label">Modo</label>
-            <select className="input" value={scanMode} onChange={(e) => setScanMode(e.target.value)}>
-              <option value="deep">Deep Scan (reintentos 1-4)</option>
-              <option value="fast">Fast (sin watchdog)</option>
-            </select>
-          </div>
-
-          <div className="row">
-            <label className="label">Cámara</label>
-            <select className="input" value={deviceId} onChange={(e) => setDeviceId(e.target.value)}>
-              {devices.length === 0 ? (
-                <option value="">(no detectada)</option>
-              ) : (
-                devices.map((d) => (
-                  <option key={d.deviceId} value={d.deviceId}>
-                    {d.label || `Camera ${d.deviceId.slice(0, 6)}…`}
-                  </option>
-                ))
-              )}
-            </select>
-          </div>
-
-          <div className="row two">
-            <label className="check">
-              <input type="checkbox" checked={autoCommit} onChange={(e) => setAutoCommit(e.target.checked)} />
-              Auto-guardar cada lectura
-            </label>
-            <label className="check">
-              <input
-                type="number"
-                min={300}
-                max={5000}
-                step={100}
-                value={cooldownMs}
-                onChange={(e) => setCooldownMs(Number(e.target.value || 1200))}
-              />
-              <span className="muted">ms anti-duplicado</span>
-            </label>
-          </div>
-
-          <div className="row">
-            <label className="label">Linterna (si tu móvil lo soporta)</label>
-            <button className="btn" onClick={toggleTorch} disabled={!torchSupported}>
-              {torchOn ? "Apagar" : "Encender"}
-            </button>
-            {!torchSupported && <div className="muted">(no disponible)</div>}
-          </div>
-
           <div className="videoBox">
             <video ref={videoRef} className="video" muted playsInline />
           </div>
-
+          
           {error && <div className="error">{error}</div>}
+
+          <div className="controls">
+            <button className="btn" onClick={() => startCamera({ attempt: 1 })}>Iniciar</button>
+            <button className="btn ghost" onClick={stopCamera}>Detener</button>
+          </div>
+
+          <div style={{ textAlign: 'center', marginTop: '1rem' }}>
+            <button className="btn ghost small" style={{ fontSize: '0.85rem', padding: '4px 8px' }} onClick={() => setShowSettings(!showSettings)}>
+              {showSettings ? "Ocultar Configuración" : "Configuración (Cámara / Modo)"}
+            </button>
+          </div>
+
+          {showSettings && (
+            <div style={{ background: 'rgba(0,0,0,0.03)', padding: '1rem', borderRadius: '8px', marginTop: '0.5rem' }}>
+              <div className="row">
+                <label className="label">Modo</label>
+                <select className="input" value={scanMode} onChange={(e) => setScanMode(e.target.value)}>
+                  <option value="deep">Deep Scan (reintentos 1-4)</option>
+                  <option value="fast">Fast (sin watchdog)</option>
+                </select>
+              </div>
+
+              <div className="row">
+                <label className="label">Cámara</label>
+                <select className="input" value={deviceId} onChange={(e) => setDeviceId(e.target.value)}>
+                  {devices.length === 0 ? (
+                    <option value="">(no detectada)</option>
+                  ) : (
+                    devices.map((d) => (
+                      <option key={d.deviceId} value={d.deviceId}>
+                        {d.label || `Camera ${d.deviceId.slice(0, 6)}…`}
+                      </option>
+                    ))
+                  )}
+                </select>
+                <button className="btn ghost small" onClick={refreshDevices} style={{marginTop: '0.5rem'}}>Recargar lista</button>
+              </div>
+
+              <div className="row two">
+                <label className="check">
+                  <input type="checkbox" checked={autoCommit} onChange={(e) => setAutoCommit(e.target.checked)} />
+                  Auto-guardar
+                </label>
+                <label className="check">
+                  <input
+                    type="number"
+                    min={300}
+                    max={5000}
+                    step={100}
+                    value={cooldownMs}
+                    onChange={(e) => setCooldownMs(Number(e.target.value || 1200))}
+                  />
+                  <span className="muted">ms espera</span>
+                </label>
+              </div>
+
+              <div className="row">
+                <label className="label">Linterna</label>
+                <button className="btn" onClick={toggleTorch} disabled={!torchSupported}>
+                  {torchOn ? "Apagar" : "Encender"}
+                </button>
+                {!torchSupported && <div className="muted" style={{fontSize: '0.8rem'}}>(no disponible)</div>}
+              </div>
+            </div>
+          )}
 
           <div className="divider" />
 
-          <h3>Fallbacks (por si la cámara falla)</h3>
-          <div className="row">
-            <label className="label">Manual</label>
-            <div className="inline">
+          <div style={{ textAlign: 'center' }}>
+            <button className="btn ghost small" style={{ fontSize: '0.85rem', padding: '4px 8px' }} onClick={() => setShowFallbacks(!showFallbacks)}>
+              {showFallbacks ? "Ocultar Manual / Foto" : "Problemas? Usar Manual / Foto"}
+            </button>
+          </div>
+
+          {showFallbacks && (
+            <div style={{ background: 'rgba(0,0,0,0.03)', padding: '1rem', borderRadius: '8px', marginTop: '0.5rem' }}>
+              <div className="row">
+                <label className="label">Manual</label>
+                <div className="inline">
               <input
                 className="input"
                 value={manual}
-                placeholder="Pega/escribe el código y Enter"
+                placeholder="Código..."
                 onChange={(e) => setManual(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") commitManual();
                 }}
               />
-              <button className="btn" onClick={commitManual}>Anadir</button>
+              <button className="btn" onClick={commitManual}>OK</button>
             </div>
           </div>
 
@@ -950,6 +969,7 @@ export default function App() {
                   Descargar Version B
                 </button>
               </div>
+            </div>
             </div>
           )}
 
@@ -1007,4 +1027,3 @@ export default function App() {
     </div>
   );
 }
-
