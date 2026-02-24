@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { BrowserMultiFormatReader } from "@zxing/browser";
+import { BrowserMultiFormatReader, BarcodeFormat, DecodeHintType } from "@zxing/browser";
+import Quagga from "@ericblade/quagga2";
 import { saveAs } from "file-saver";
 import * as XLSX from "xlsx";
 import "./app.css";
@@ -10,21 +11,26 @@ function nowIsoLocal() {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-function beep() {
+function playSuccessSound() {
+  // If you want to use a custom file, uncomment:
+  // new Audio('/scan-beep.mp3').play().catch(() => {});
+
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const o = ctx.createOscillator();
-    const g = ctx.createGain();
-    o.type = "sine";
-    o.frequency.value = 880;
-    o.connect(g);
-    g.connect(ctx.destination);
-    g.gain.setValueAtTime(0.0001, ctx.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.08, ctx.currentTime + 0.01);
-    g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.12);
-    o.start();
-    o.stop(ctx.currentTime + 0.14);
-    setTimeout(() => ctx.close().catch(() => {}), 250);
+    const t = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(1200, t);
+    osc.frequency.exponentialRampToValueAtTime(600, t + 0.15);
+    gain.gain.setValueAtTime(0.15, t);
+    gain.gain.exponentialRampToValueAtTime(0.01, t + 0.15);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(t);
+    osc.stop(t + 0.2);
+    setTimeout(() => ctx.close().catch(() => {}), 300);
   } catch {
     // ignore
   }
@@ -59,7 +65,7 @@ function normalizeText(txt) {
 function isLikelyBarcode(value) {
   // barcode can be numeric/alphanum; we only filter out super short noise
   const v = normalizeText(value);
-  return v.length >= 6; // conservative
+  return v.length >= 5; // conservative
 }
 
 function uniqueByRecent(rows, newValue, windowMs = 1200) {
@@ -395,6 +401,18 @@ function otsu(gray) {
   return threshold;
 }
 
+function binarizeCanvas(canvas, threshold) {
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const gray = grayFromImageData(imgData.data);
+  const th = threshold || otsu(gray);
+  for (let i = 0; i < gray.length; i++) {
+    const val = gray[i] >= th ? 255 : 0;
+    imgData.data[i * 4] = imgData.data[i * 4 + 1] = imgData.data[i * 4 + 2] = val;
+  }
+  ctx.putImageData(imgData, 0, 0);
+}
+
 function preprocessForScanner(sourceCanvas) {
   const cropped = autoCropLabel(sourceCanvas);
   const angle = estimateBestSkewAngle(cropped);
@@ -438,10 +456,20 @@ function canvasToBlob(canvas) {
   });
 }
 
+// --- Stability / Motion Detection ---
+function calculateFrameDiff(dataA, dataB) {
+  if (!dataA || !dataB || dataA.length !== dataB.length) return 100;
+  let diff = 0;
+  for (let i = 0; i < dataA.length; i += 4) { // sample pixels
+    diff += Math.abs(dataA[i] - dataB[i]);
+  }
+  return diff / (dataA.length / 4);
+}
+
 export default function App() {
   const videoRef = useRef(null);
+  const canvasRef = useRef(null); // Internal canvas for processing
   const readerRef = useRef(null);
-  const controlsRef = useRef(null);
 
   const [rows, setRows] = useState(() => loadRows());
   const [status, setStatus] = useState("Listo. Dale permiso a la cámara y escanea.");
@@ -450,13 +478,16 @@ export default function App() {
   const [deviceId, setDeviceId] = useState("");
   const [torchSupported, setTorchSupported] = useState(false);
   const [torchOn, setTorchOn] = useState(false);
-  const [scanMode, setScanMode] = useState("deep"); // deep | fast
+  const [scanMode, setScanMode] = useState("deep"); 
   const [autoCommit, setAutoCommit] = useState(true);
   const [manual, setManual] = useState("");
   const [cooldownMs, setCooldownMs] = useState(1200);
   const [processed, setProcessed] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showFallbacks, setShowFallbacks] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [scanPhase, setScanPhase] = useState(0); // 0: Normal, 1: Focus/Res, 2: Preprocess, 3: Deep
+  const [roiStyle, setRoiStyle] = useState({});
 
   const count = rows.length;
 
@@ -466,12 +497,26 @@ export default function App() {
 
   const orderedRows = useMemo(() => [...rows].reverse(), [rows]);
 
-  async function ensureReader() {
+  // Initialize ZXing Reader with Hints
+  const getReader = () => {
     if (!readerRef.current) {
-      readerRef.current = new BrowserMultiFormatReader();
+      const hints = new Map();
+      const formats = [
+        BarcodeFormat.CODE_128,
+        BarcodeFormat.CODE_39,
+        BarcodeFormat.EAN_13,
+        BarcodeFormat.EAN_8,
+        BarcodeFormat.ITF,
+        BarcodeFormat.UPC_A,
+        BarcodeFormat.UPC_E,
+        BarcodeFormat.CODABAR
+      ];
+      hints.set(DecodeHintType.POSSIBLE_FORMATS, formats);
+      hints.set(DecodeHintType.TRY_HARDER, true);
+      readerRef.current = new BrowserMultiFormatReader(hints);
     }
     return readerRef.current;
-  }
+  };
 
   async function refreshDevices() {
     setError("");
@@ -494,196 +539,301 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // --- Scanner Logic ---
+  const scanState = useRef({
+    active: false,
+    lastFrameData: null,
+    consecutiveStableFrames: 0,
+    lastScanTime: 0,
+    phaseStartTime: 0,
+    stream: null,
+    track: null
+  });
+
   async function stopCamera() {
-    try {
-      controlsRef.current?.stop?.();
-    } catch {
-      // ignore
+    scanState.current.active = false;
+    if (scanState.current.stream) {
+      scanState.current.stream.getTracks().forEach(t => t.stop());
+      scanState.current.stream = null;
     }
-    controlsRef.current = null;
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    setScanning(false);
     setTorchSupported(false);
     setTorchOn(false);
+    setScanPhase(0);
   }
 
-  async function startCamera({ attempt = 1 } = {}) {
-    setError("");
-    setStatus(`Iniciando cámara (intento ${attempt}/4)…`);
-
+  async function startCamera() {
     await stopCamera();
+    setError("");
+    setStatus("Iniciando cámara...");
+    setScanning(true);
+    scanState.current.active = true;
+    scanState.current.phaseStartTime = Date.now();
+
+    try {
+      const constraints = {
+        video: {
+          deviceId: deviceId ? { exact: deviceId } : undefined,
+          facingMode: deviceId ? undefined : { ideal: "environment" },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          focusMode: { ideal: "continuous" }
+        }
+      };
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      scanState.current.stream = stream;
+      
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.onloadedmetadata = () => {
+          videoRef.current.play().catch(e => console.warn("Play error", e));
+          requestAnimationFrame(scanLoop);
+        };
+      }
+
+      const track = stream.getVideoTracks()[0];
+      scanState.current.track = track;
+      
+      // Capabilities check
+      const caps = track.getCapabilities?.() || {};
+      setTorchSupported(!!caps.torch);
+
+      // Apply advanced constraints if possible
+      if (track.applyConstraints) {
+        const advanced = [];
+        if (caps.focusMode?.includes('continuous')) advanced.push({ focusMode: 'continuous' });
+        if (caps.exposureMode?.includes('continuous')) advanced.push({ exposureMode: 'continuous' });
+        if (advanced.length > 0) {
+          track.applyConstraints({ advanced }).catch(() => {});
+        }
+      }
+
+      setStatus("Buscando código...");
+    } catch (e) {
+      console.error(e);
+      setError("Error al acceder a la cámara. Verifica permisos.");
+      setScanning(false);
+    }
+  }
+
+  // --- Main Scan Loop ---
+  async function scanLoop() {
+    if (!scanState.current.active || !videoRef.current) return;
 
     const video = videoRef.current;
-    if (!video) {
-      setError("Video element no disponible.");
+    if (video.readyState !== video.HAVE_ENOUGH_DATA) {
+      requestAnimationFrame(scanLoop);
       return;
     }
 
-    const reader = await ensureReader();
-
-    // Attempt strategy (deep scan):
-    // 1) Standard constraints
-    // 2) Higher resolution + focus hints
-    // 3) Switch device (if available)
-    // 4) Recreate reader and retry
-
-    const constraintsByAttempt = [
-      { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: { ideal: "environment" } },
-      { width: { ideal: 1920 }, height: { ideal: 1080 }, facingMode: { ideal: "environment" } },
-      { width: { ideal: 2560 }, height: { ideal: 1440 }, facingMode: { ideal: "environment" } },
-      { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: { ideal: "environment" } },
-    ];
-
-    const shouldSwitchDevice = scanMode === "deep" && attempt === 3 && devices.length > 1;
-
-    let useDeviceId = deviceId;
-    if (shouldSwitchDevice) {
-      const idx = devices.findIndex((d) => d.deviceId === deviceId);
-      const next = devices[(idx + 1) % devices.length];
-      useDeviceId = next.deviceId;
-      setDeviceId(useDeviceId);
-      setStatus(`Cambiando de cámara para mejorar lectura…`);
+    // Prepare canvas
+    if (!canvasRef.current) {
+      canvasRef.current = document.createElement('canvas');
+    }
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    
+    // Resize canvas to video dimensions (or smaller for performance)
+    if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      // Update ROI style for UI
+      const roiSize = Math.min(video.videoWidth, video.videoHeight) * 0.6;
+      setRoiStyle({
+        width: roiSize,
+        height: roiSize * 0.6, // Rectangular for barcodes
+        top: (video.videoHeight - roiSize * 0.6) / 2,
+        left: (video.videoWidth - roiSize) / 2
+      });
     }
 
-    if (scanMode === "deep" && attempt === 4) {
-      // recreate reader (rare cases)
-      try {
-        readerRef.current = new BrowserMultiFormatReader();
-      } catch {
-        // ignore
-      }
+    ctx.drawImage(video, 0, 0);
+    
+    // 1. Stability Check (Motion Gating)
+    // We sample a small center area for stability to be fast
+    const sampleSize = 32;
+    const sx = (canvas.width - sampleSize) / 2;
+    const sy = (canvas.height - sampleSize) / 2;
+    const currentFrameData = ctx.getImageData(sx, sy, sampleSize, sampleSize).data;
+    
+    const diff = calculateFrameDiff(scanState.current.lastFrameData, currentFrameData);
+    scanState.current.lastFrameData = currentFrameData;
+
+    if (diff > 25) { // Threshold for motion
+      scanState.current.consecutiveStableFrames = 0;
+      // If moving too much, skip heavy decode, just wait
+      requestAnimationFrame(scanLoop);
+      return;
+    }
+    scanState.current.consecutiveStableFrames++;
+
+    // Only decode if stable for a few frames (~100ms)
+    if (scanState.current.consecutiveStableFrames > 3) {
+      await attemptDecode(canvas, ctx);
     }
 
-    const constraints = constraintsByAttempt[Math.min(attempt - 1, constraintsByAttempt.length - 1)];
-
-    try {
-      // decodeFromVideoDevice: continuous scanning; callback for each result
-      controlsRef.current = await reader.decodeFromVideoDevice(
-        useDeviceId || null,
-        video,
-        (result, err, controls) => {
-          // keep controls reference in case lib returns a new one
-          controlsRef.current = controlsRef.current || controls;
-
-          if (result) {
-            const text = normalizeText(result.getText());
-            const format = result.getBarcodeFormat?.() ?? "";
-            setStatus(`Detectado: ${text}`);
-
-            if (autoCommit && isLikelyBarcode(text)) {
-              setRows((prev) => {
-                if (!uniqueByRecent(prev, text, cooldownMs)) return prev;
-                const next = [
-                  ...prev,
-                  { _ts: Date.now(), timestamp: nowIsoLocal(), barcode: text, format: String(format) },
-                ];
-                return next;
-              });
-              beep();
-            }
-          }
-
-          // Ignore "NotFoundException" etc. We use retry loop separately.
-          if (err && err?.name && !/NotFoundException/i.test(err.name)) {
-            // show only meaningful errors
-            setError((prev) => prev || `Scanner: ${err?.message || err}`);
-          }
-        },
-        constraints
-      );
-
-      setStatus("Cámara lista. Escanea ahora.");
-
-      // Try to detect torch capability
-      setTimeout(async () => {
-        try {
-          const stream = video.srcObject;
-          if (!stream) return;
-          const track = stream.getVideoTracks?.()[0];
-          if (!track) return;
-          const caps = track.getCapabilities?.();
-          const torchCap = !!caps?.torch;
-          setTorchSupported(torchCap);
-        } catch {
-          setTorchSupported(false);
-        }
-      }, 350);
-
-      // Deep scan retry watchdog: if nothing is committed for some time, restart with stronger attempts
-      if (scanMode === "deep") {
-        startRetryWatchdog();
-      }
-    } catch (e) {
-      setError(`No pude iniciar cámara: ${e?.message || e}`);
-      setStatus("Error iniciando cámara.");
-      if (scanMode === "deep" && attempt < 4) {
-        // immediate retry
-        setTimeout(() => startCamera({ attempt: attempt + 1 }), 600);
-      }
-    }
+    requestAnimationFrame(scanLoop);
   }
 
-  const watchdogRef = useRef({ timer: null, lastCount: 0, streak: 0 });
+  async function attemptDecode(canvas, ctx) {
+    const now = Date.now();
+    // Debounce scans
+    if (now - scanState.current.lastScanTime < 100) return; 
+    scanState.current.lastScanTime = now;
 
-  function startRetryWatchdog() {
-    stopRetryWatchdog();
-    watchdogRef.current.lastCount = rows.length;
-    watchdogRef.current.streak = 0;
+    // Determine Phase based on time since start without success
+    const elapsed = now - scanState.current.phaseStartTime;
+    let phase = 0;
+    if (elapsed > 2000) phase = 1; // After 2s, try harder
+    if (elapsed > 5000) phase = 2; // After 5s, preprocess
+    if (elapsed > 8000) phase = 3; // After 8s, deep scan
+    
+    if (phase !== scanPhase) {
+      setScanPhase(phase);
+      if (phase === 1) setStatus("Enfocando...");
+      if (phase === 2) setStatus("Ajustando contraste...");
+      if (phase === 3) setStatus("Escaneo profundo...");
+    }
 
-    watchdogRef.current.timer = window.setInterval(async () => {
-      const currentCount = loadRows().length; // localStorage is the source of truth across tab refresh
-      const stale = currentCount === watchdogRef.current.lastCount;
-      watchdogRef.current.lastCount = currentCount;
+    // --- Pipeline ---
 
-      if (!stale) {
-        watchdogRef.current.streak = 0;
+    // 1. Primary: ZXing (Fastest)
+    try {
+      const reader = getReader();
+      // We use decodeFromCanvas which is synchronous-ish wrapper in zxing-browser but actually heavy
+      // To avoid blocking UI too much, we rely on the loop interval
+      const result = await reader.decodeFromCanvas(canvas);
+      if (result) {
+        handleScanSuccess(result.getText(), result.getBarcodeFormat());
         return;
       }
+    } catch {
+      // ZXing failed
+    }
 
-      watchdogRef.current.streak += 1;
+    // 2. Secondary: Quagga (Robust for some 1D)
+    // Only run Quagga every few frames or if Phase > 0 to save CPU
+    if (phase > 0 || (scanState.current.consecutiveStableFrames % 3 === 0)) {
+      try {
+        await new Promise((resolve, reject) => {
+          Quagga.decodeSingle({
+            src: canvas.toDataURL("image/jpeg"), // Quagga needs base64 or element
+            numOfWorkers: 0, // Main thread to avoid worker overhead for single check
+            inputStream: { size: canvas.width },
+            decoder: { readers: ["code_128_reader", "ean_reader", "code_39_reader", "i2of5_reader"] },
+          }, (res) => {
+            if (res && res.codeResult && res.codeResult.code) {
+              handleScanSuccess(res.codeResult.code, res.codeResult.format);
+              resolve();
+            } else {
+              reject();
+            }
+          });
+        });
+        return;
+      } catch {
+        // Quagga failed
+      }
+    }
 
-      // Every ~6 seconds without new row: bump attempt
-      if (watchdogRef.current.streak === 3) {
-        setStatus("No veo lectura estable… mejorando búsqueda (intento 2/4)…");
-        startCamera({ attempt: 2 });
+    // 3. Preprocessing (Phase 2+)
+    if (phase >= 2) {
+      // Apply contrast/grayscale in place on canvas context
+      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const gray = grayFromImageData(imgData.data);
+      // Simple contrast stretch
+      const stretched = stretch(gray, 0.05, 0.95);
+      // Put back
+      for (let i = 0; i < stretched.length; i++) {
+        const v = stretched[i];
+        imgData.data[i*4] = v;
+        imgData.data[i*4+1] = v;
+        imgData.data[i*4+2] = v;
       }
-      if (watchdogRef.current.streak === 6) {
-        setStatus("Sigo sin lectura… mejorando búsqueda (intento 3/4)…");
-        startCamera({ attempt: 3 });
-      }
-      if (watchdogRef.current.streak === 9) {
-        setStatus("Último intento: reinicio profundo del lector (4/4)…");
-        startCamera({ attempt: 4 });
-      }
-    }, 2000);
+      ctx.putImageData(imgData, 0, 0);
+      
+      // Retry ZXing on processed frame
+      try {
+        const reader = getReader();
+        const result = await reader.decodeFromCanvas(canvas);
+        if (result) {
+          handleScanSuccess(result.getText(), result.getBarcodeFormat());
+          return;
+        }
+      } catch {}
+    }
+
+    // 4. Deep Scan (Phase 3+) - Binarization
+    if (phase >= 3) {
+      binarizeCanvas(canvas); // Otsu thresholding
+      try {
+        const reader = getReader();
+        const result = await reader.decodeFromCanvas(canvas);
+        if (result) {
+          handleScanSuccess(result.getText(), result.getBarcodeFormat());
+          return;
+        }
+      } catch {}
+    }
+
+    // If we reach here in Phase 3 multiple times, show hint
+    if (phase === 3 && scanState.current.consecutiveStableFrames % 60 === 0) {
+      setStatus("Intenta acercar/alejar o mejorar la luz.");
+    }
   }
 
-  function stopRetryWatchdog() {
-    if (watchdogRef.current.timer) {
-      clearInterval(watchdogRef.current.timer);
-      watchdogRef.current.timer = null;
+  function handleScanSuccess(text, format) {
+    const cleanText = normalizeText(text);
+    if (!isLikelyBarcode(cleanText)) return;
+
+    // Debounce duplicate scans
+    if (!uniqueByRecent(rows, cleanText, cooldownMs)) {
+      // Visual feedback for duplicate scan?
+      return;
+    }
+
+    playSuccessSound();
+    setRows(prev => [
+      ...prev,
+      { _ts: Date.now(), timestamp: nowIsoLocal(), barcode: cleanText, format: String(format) }
+    ]);
+    setStatus(`Detectado: ${cleanText}`);
+    
+    // Reset phase on success
+    scanState.current.phaseStartTime = Date.now();
+    setScanPhase(0);
+    
+    // Visual flash effect on ROI
+    const roi = document.getElementById("scanner-roi");
+    if (roi) {
+      roi.style.borderColor = "#4ade80";
+      roi.style.boxShadow = "0 0 20px #4ade80";
+      setTimeout(() => {
+        roi.style.borderColor = "rgba(255, 255, 255, 0.8)";
+        roi.style.boxShadow = "0 0 0 9999px rgba(0, 0, 0, 0.5)";
+      }, 300);
     }
   }
 
   useEffect(() => {
     return () => {
-      stopRetryWatchdog();
       stopCamera();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function toggleTorch() {
-    setError("");
+    if (!scanState.current.track) return;
     try {
-      const video = videoRef.current;
-      const stream = video?.srcObject;
-      const track = stream?.getVideoTracks?.()[0];
-      if (!track) throw new Error("No video track.");
-
       const next = !torchOn;
-      await track.applyConstraints({ advanced: [{ torch: next }] });
+      await scanState.current.track.applyConstraints({ advanced: [{ torch: next }] });
       setTorchOn(next);
     } catch (e) {
-      setError(`Torch no disponible: ${e?.message || e}`);
+      // ignore
     }
   }
 
@@ -734,7 +884,7 @@ export default function App() {
       { _ts: Date.now(), timestamp: nowIsoLocal(), barcode: v, format: "MANUAL" },
     ]);
     setManual("");
-    beep();
+    playSuccessSound();
     setStatus(`Agregado manual: ${v}`);
   }
 
@@ -758,7 +908,7 @@ export default function App() {
     setError("");
     setStatus("Preprocesando imagen para barcode y OCR...");
     try {
-      const reader = await ensureReader();
+      const reader = getReader();
       const url = URL.createObjectURL(file);
       const img = new Image();
       img.onload = async () => {
@@ -794,7 +944,7 @@ export default function App() {
             ...prev,
             { _ts: Date.now(), timestamp: nowIsoLocal(), barcode: decoded.text, format: decoded.format },
           ]);
-          beep();
+          playSuccessSound();
           setStatus(`Detectado en ${decoded.pass}: ${decoded.text}`);
         } catch (e) {
           setError(`No pude leer el código desde la imagen: ${e?.message || e}`);
@@ -833,13 +983,27 @@ export default function App() {
           </div>
 
           <div className="videoBox">
-            <video ref={videoRef} className="video" muted playsInline />
+            <video ref={videoRef} className="video" muted playsInline autoPlay />
+            {scanning && (
+              <div 
+                id="scanner-roi"
+                className="scanner-roi" 
+                style={{
+                  position: 'absolute',
+                  border: '2px solid rgba(255, 255, 255, 0.8)',
+                  boxShadow: '0 0 0 9999px rgba(0, 0, 0, 0.5)',
+                  borderRadius: '8px',
+                  transition: 'all 0.2s ease',
+                  ...roiStyle
+                }}
+              />
+            )}
           </div>
           
           {error && <div className="error">{error}</div>}
 
           <div className="controls">
-            <button className="btn" onClick={() => startCamera({ attempt: 1 })}>Iniciar</button>
+            <button className="btn" onClick={startCamera} disabled={scanning}>Iniciar</button>
             <button className="btn ghost" onClick={stopCamera}>Detener</button>
           </div>
 

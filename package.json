@@ -13,6 +13,7 @@
     "deploy": "gh-pages -d dist"
   },
   "dependencies": {
+    "@ericblade/quagga2": "^1.4.2",
     "@zxing/browser": "^0.1.5",
     "file-saver": "^2.0.5",
     "react": "^19.2.0",
