@@ -1070,31 +1070,31 @@ export default function App() {
           {error && <div className="error">{error}</div>}
 
           <div className="controls">
-            <button className="btn" onClick={startCamera} disabled={scanning}>Iniciar</button>
-            <button className="btn ghost" onClick={stopCamera}>Detener</button>
+            <button className="btn" onClick={startCamera} disabled={scanning}>Start</button>
+            <button className="btn ghost" onClick={stopCamera}>Stop</button>
           </div>
 
           <div style={{ textAlign: 'center', marginTop: '1rem' }}>
             <button className="btn ghost small" style={{ fontSize: '0.85rem', padding: '4px 8px' }} onClick={() => setShowSettings(!showSettings)}>
-              {showSettings ? "Ocultar ConfiguraciÃ³n" : "ConfiguraciÃ³n (CÃ¡mara / Modo)"}
+              {showSettings ? "Hide Settings" : "Settings (Camera / Mode)"}
             </button>
           </div>
 
           {showSettings && (
             <div style={{ background: 'rgba(0,0,0,0.03)', padding: '1rem', borderRadius: '8px', marginTop: '0.5rem' }}>
               <div className="row">
-                <label className="label">Modo</label>
+                <label className="label">Mode</label>
                 <select className="input" value={scanMode} onChange={(e) => setScanMode(e.target.value)}>
-                  <option value="deep">Deep Scan (reintentos 1-4)</option>
-                  <option value="fast">Fast (sin watchdog)</option>
+                  <option value="deep">Deep Scan (retries 1-4)</option>
+                  <option value="fast">Fast (no watchdog)</option>
                 </select>
               </div>
 
               <div className="row">
-                <label className="label">CÃ¡mara</label>
+                <label className="label">Camera</label>
                 <select className="input" value={deviceId} onChange={(e) => setDeviceId(e.target.value)}>
                   {devices.length === 0 ? (
-                    <option value="">(no detectada)</option>
+                    <option value="">(not detected)</option>
                   ) : (
                     devices.map((d) => (
                       <option key={d.deviceId} value={d.deviceId}>
@@ -1103,13 +1103,13 @@ export default function App() {
                     ))
                   )}
                 </select>
-                <button className="btn ghost small" onClick={refreshDevices} style={{marginTop: '0.5rem'}}>Recargar lista</button>
+                <button className="btn ghost small" onClick={refreshDevices} style={{marginTop: '0.5rem'}}>Reload list</button>
               </div>
 
               <div className="row two">
                 <label className="check">
                   <input type="checkbox" checked={autoCommit} onChange={(e) => setAutoCommit(e.target.checked)} />
-                  Auto-guardar
+                  Auto-save
                 </label>
                 <label className="check">
                   <input
@@ -1120,16 +1120,16 @@ export default function App() {
                     value={cooldownMs}
                     onChange={(e) => setCooldownMs(Number(e.target.value || 1200))}
                   />
-                  <span className="muted">ms espera</span>
+                  <span className="muted">ms wait</span>
                 </label>
               </div>
 
               <div className="row">
-                <label className="label">Linterna</label>
+                <label className="label">Flashlight</label>
                 <button className="btn" onClick={toggleTorch} disabled={!torchSupported}>
-                  {torchOn ? "Apagar" : "Encender"}
+                  {torchOn ? "Turn off" : "Turn on"}
                 </button>
-                {!torchSupported && <div className="muted" style={{fontSize: '0.8rem'}}>(no disponible)</div>}
+                {!torchSupported && <div className="muted" style={{fontSize: '0.8rem'}}>(not available)</div>}
               </div>
             </div>
           )}
@@ -1138,7 +1138,7 @@ export default function App() {
 
           <div style={{ textAlign: 'center' }}>
             <button className="btn ghost small" style={{ fontSize: '0.85rem', padding: '4px 8px' }} onClick={() => setShowFallbacks(!showFallbacks)}>
-              {showFallbacks ? "Ocultar Manual / Foto" : "Problemas? Usar Manual / Foto"}
+              {showFallbacks ? "Hide Manual / Photo" : "Problems? Use Manual / Photo"}
             </button>
           </div>
 
@@ -1150,7 +1150,7 @@ export default function App() {
               <input
                 className="input"
                 value={manual}
-                placeholder="CÃ³digo..."
+                placeholder="Code..."
                 onChange={(e) => setManual(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") commitManual();
@@ -1161,7 +1161,7 @@ export default function App() {
           </div>
 
           <div className="row">
-            <label className="label">Leer desde foto</label>
+            <label className="label">Read from photo</label>
             <input
               className="input"
               type="file"
@@ -1172,15 +1172,15 @@ export default function App() {
                 e.target.value = "";
               }}
             />
-            <div className="muted">Tip: foto bien enfocada, sin reflejos.</div>
+            <div className="muted">Tip: use a sharp photo without glare.</div>
           </div>
 
           {processed && (
             <div className="processedBlock">
-              <div className="muted">Resultado de preprocesado listo para scanner automatico</div>
+              <div className="muted">Preprocessed output ready for automatic scanner</div>
               <div className="processedGrid">
                 <figure>
-                  <figcaption>ROI recortado automaticamente</figcaption>
+                  <figcaption>Automatically cropped ROI</figcaption>
                   <img src={processed.cropPreview} alt="ROI" />
                 </figure>
                 <figure>
@@ -1194,10 +1194,10 @@ export default function App() {
               </div>
               <div className="controls">
                 <button className="btn" onClick={() => saveAs(processed.versionABlob, "processed-barcode-vA.png")}>
-                  Descargar Version A
+                  Download Version A
                 </button>
                 <button className="btn" onClick={() => saveAs(processed.versionBBlob, "processed-ocr-vB.png")}>
-                  Descargar Version B
+                  Download Version B
                 </button>
               </div>
             </div>
@@ -1209,12 +1209,12 @@ export default function App() {
 
         <div className="card listCard">
           <div className="cardHead">
-            <h2>Tabla</h2>
-            <div className="muted">Cada lectura agrega una lÃ­nea nueva. Se guarda localmente.</div>
+            <h2>Scans</h2>
+            <div className="muted">Each scan adds a new row. Data is saved locally.</div>
           </div>
 
           <div className="tableActions">
-            <button className="btn ghost" onClick={clearAll} disabled={rows.length === 0}>Borrar todo</button>
+            <button className="btn ghost" onClick={clearAll} disabled={rows.length === 0}>Clear all</button>
           </div>
 
           <div className="tableWrap">
@@ -1228,7 +1228,7 @@ export default function App() {
               </thead>
               <tbody>
                 {orderedRows.length === 0 ? (
-                  <tr><td colSpan="3" className="muted">No hay lecturas aÃºn.</td></tr>
+                  <tr><td colSpan="3" className="muted">No scans yet.</td></tr>
                 ) : (
                   orderedRows.map((r, i) => (
                     <tr key={`${r._ts}-${i}`}>
@@ -1243,15 +1243,15 @@ export default function App() {
           </div>
 
           <div className="note">
-            <strong>Excel:</strong> Exporta un .xlsx listo. Si quieres â€œllenar un Excel existenteâ€, puedes importar una plantilla
-            y exportar de nuevo (lo dejo listo para ampliar en <code>exportXlsx()</code>).
+            <strong>Excel:</strong> Exports a ready .xlsx file. If you want to fill an existing Excel file, you can
+            import a template and export again (easy to extend in <code>exportXlsx()</code>).
           </div>
         </div>
       </section>
 
       <footer className="foot">
         <div className="muted">
-          Deep Scan hace reintentos automaticos (hasta 4) si no detecta nada: resolucion, cambio de camara y reinicio lector.
+          Deep Scan retries automatically (up to 4) when nothing is detected: resolution boost, camera switch, and reader restart.
         </div>
       </footer>
     </div>
