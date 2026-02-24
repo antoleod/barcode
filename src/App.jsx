@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { BrowserMultiFormatReader, BarcodeFormat, DecodeHintType } from "@zxing/browser";
 import Quagga from "@ericblade/quagga2";
 import { saveAs } from "file-saver";
+import Tesseract from "tesseract.js";
 import * as XLSX from "xlsx";
 import "./app.css";
 
@@ -413,6 +414,18 @@ function binarizeCanvas(canvas, threshold) {
   ctx.putImageData(imgData, 0, 0);
 }
 
+function invertCanvas(canvas) {
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imgData.data;
+  for (let i = 0; i < data.length; i += 4) {
+    data[i] = 255 - data[i];     // r
+    data[i + 1] = 255 - data[i + 1]; // g
+    data[i + 2] = 255 - data[i + 2]; // b
+  }
+  ctx.putImageData(imgData, 0, 0);
+}
+
 function preprocessForScanner(sourceCanvas) {
   const cropped = autoCropLabel(sourceCanvas);
   const angle = estimateBestSkewAngle(cropped);
@@ -547,7 +560,8 @@ export default function App() {
     lastScanTime: 0,
     phaseStartTime: 0,
     stream: null,
-    track: null
+    track: null,
+    ocrBusy: false
   });
 
   async function stopCamera() {
@@ -691,12 +705,14 @@ export default function App() {
     if (elapsed > 2000) phase = 1; // After 2s, try harder
     if (elapsed > 5000) phase = 2; // After 5s, preprocess
     if (elapsed > 8000) phase = 3; // After 8s, deep scan
+    if (elapsed > 12000) phase = 4; // After 12s, desperate (OCR)
     
     if (phase !== scanPhase) {
       setScanPhase(phase);
       if (phase === 1) setStatus("Enfocando...");
       if (phase === 2) setStatus("Ajustando contraste...");
-      if (phase === 3) setStatus("Escaneo profundo...");
+      if (phase === 3) setStatus("Probando inversión y filtros...");
+      if (phase === 4) setStatus("Intentando leer números (OCR)...");
     }
 
     // --- Pipeline ---
@@ -780,8 +796,42 @@ export default function App() {
       } catch {}
     }
 
-    // If we reach here in Phase 3 multiple times, show hint
-    if (phase === 3 && scanState.current.consecutiveStableFrames % 60 === 0) {
+    // 5. Deep Scan (Phase 3) - Inversion (Negative)
+    if (phase >= 3) {
+      // Invert colors in place
+      invertCanvas(canvas);
+      try {
+        const reader = getReader();
+        const result = await reader.decodeFromCanvas(canvas);
+        if (result) {
+          handleScanSuccess(result.getText(), result.getBarcodeFormat());
+          return;
+        }
+      } catch {}
+      // Revert inversion for next steps if any (though we redraw next frame anyway)
+      invertCanvas(canvas); 
+    }
+
+    // 6. OCR Fallback (Phase 4) - Read Numbers
+    // Only run if not busy and throttled (every ~2s)
+    if (phase >= 4 && !scanState.current.ocrBusy && (now - scanState.current.lastOcrTime > 2000 || !scanState.current.lastOcrTime)) {
+      scanState.current.ocrBusy = true;
+      scanState.current.lastOcrTime = now;
+      
+      tryOcr(canvas)
+        .then((res) => {
+          if (res.ok) {
+            handleScanSuccess(res.text, res.format);
+          }
+        })
+        .catch(err => console.warn("OCR error", err))
+        .finally(() => {
+          scanState.current.ocrBusy = false;
+        });
+    }
+
+    // If we reach here in Phase 4 multiple times, show hint
+    if (phase === 4 && scanState.current.consecutiveStableFrames % 60 === 0) {
       setStatus("Intenta acercar/alejar o mejorar la luz.");
     }
   }
@@ -904,6 +954,26 @@ export default function App() {
     return { ok: false };
   }
 
+  async function tryOcr(canvas) {
+    try {
+      const worker = await Tesseract.createWorker("eng");
+      await worker.setParameters({
+        tessedit_char_whitelist: "0123456789",
+      });
+      const { data: { text } } = await worker.recognize(canvas);
+      await worker.terminate();
+
+      const matches = text.match(/\b\d{5,}\b/g);
+      if (matches && matches.length > 0) {
+        const best = matches.sort((a, b) => b.length - a.length)[0];
+        return { ok: true, text: best, format: "OCR_TEXT", pass: "OCR" };
+      }
+    } catch (e) {
+      console.warn("OCR error", e);
+    }
+    return { ok: false };
+  }
+
   async function decodeFromImage(file) {
     setError("");
     setStatus("Preprocesando imagen para barcode y OCR...");
@@ -933,6 +1003,13 @@ export default function App() {
             { name: "Fallback B (edge emphasis)", canvas: pack.fallbackB },
             { name: "Fallback C (threshold binarization)", canvas: pack.fallbackC },
           ]);
+
+          if (!decoded.ok) {
+            setStatus("Barcode falló. Intentando leer números (OCR)...");
+            // Try OCR on the cleanest version (Version B)
+            const ocrResult = await tryOcr(pack.versionB);
+            if (ocrResult.ok) Object.assign(decoded, ocrResult);
+          }
 
           if (!decoded.ok) {
             setError("No pude detectar barcode tras todas las pasadas de preprocesado.");
