@@ -2,7 +2,7 @@
   "name": "barcode-excel-scanner",
   "private": true,
   "version": "0.0.0",
-  "homepage": "https://antoleod.github.io/barcode-excel-scanner/",
+  "homepage": "https://antoleod.github.io/barcode/",
   "type": "module",
   "scripts": {
     "dev": "vite",

@@ -142,9 +142,46 @@ h3 { margin: 12px 0 8px 0; font-size: 14px; }
   line-height: 1.4;
 }
 
+.processedBlock {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid rgba(255,255,255,0.14);
+  border-radius: 12px;
+  background: rgba(255,255,255,0.03);
+}
+
+.processedGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.processedGrid figure {
+  margin: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.processedGrid figcaption {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.processedGrid img {
+  width: 100%;
+  height: 110px;
+  object-fit: contain;
+  border: 1px solid rgba(255,255,255,0.14);
+  border-radius: 10px;
+  background: rgba(0,0,0,0.2);
+}
+
 .foot { margin-top: 14px; color: var(--muted); font-size: 12px; }
 
 @media (max-width: 980px) {
   .grid { grid-template-columns: 1fr; }
   .video { height: 280px; }
+  .processedGrid { grid-template-columns: 1fr; }
+  .processedGrid img { height: 150px; }
 }

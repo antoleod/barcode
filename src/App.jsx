@@ -71,6 +71,373 @@ function uniqueByRecent(rows, newValue, windowMs = 1200) {
   return Date.now() - lastT > windowMs;
 }
 
+function clamp(value, min = 0, max = 255) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function createCanvas(width, height) {
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(width));
+  c.height = Math.max(1, Math.round(height));
+  return c;
+}
+
+function imageToCanvas(img) {
+  const canvas = createCanvas(img.naturalWidth || img.width, img.naturalHeight || img.height);
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
+function grayFromImageData(data) {
+  const out = new Float32Array(data.length / 4);
+  for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
+    out[p] = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+  }
+  return out;
+}
+
+function grayToCanvas(gray, width, height) {
+  const canvas = createCanvas(width, height);
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const imageData = ctx.createImageData(width, height);
+  for (let i = 0, p = 0; p < gray.length; i += 4, p += 1) {
+    const v = clamp(Math.round(gray[p]));
+    imageData.data[i] = v;
+    imageData.data[i + 1] = v;
+    imageData.data[i + 2] = v;
+    imageData.data[i + 3] = 255;
+  }
+  ctx.putImageData(imageData, 0, 0);
+  return canvas;
+}
+
+function boxBlur(gray, width, height, radius = 2) {
+  if (radius <= 0) return new Float32Array(gray);
+  const tmp = new Float32Array(gray.length);
+  const out = new Float32Array(gray.length);
+  const win = radius * 2 + 1;
+
+  for (let y = 0; y < height; y += 1) {
+    let sum = 0;
+    for (let k = -radius; k <= radius; k += 1) {
+      sum += gray[y * width + clamp(k, 0, width - 1)];
+    }
+    for (let x = 0; x < width; x += 1) {
+      tmp[y * width + x] = sum / win;
+      const a = clamp(x - radius, 0, width - 1);
+      const b = clamp(x + radius + 1, 0, width - 1);
+      sum += gray[y * width + b] - gray[y * width + a];
+    }
+  }
+
+  for (let x = 0; x < width; x += 1) {
+    let sum = 0;
+    for (let k = -radius; k <= radius; k += 1) {
+      sum += tmp[clamp(k, 0, height - 1) * width + x];
+    }
+    for (let y = 0; y < height; y += 1) {
+      out[y * width + x] = sum / win;
+      const a = clamp(y - radius, 0, height - 1);
+      const b = clamp(y + radius + 1, 0, height - 1);
+      sum += tmp[b * width + x] - tmp[a * width + x];
+    }
+  }
+
+  return out;
+}
+
+function median3x3(gray, width, height) {
+  const out = new Float32Array(gray.length);
+  const values = [];
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      values.length = 0;
+      for (let dy = -1; dy <= 1; dy += 1) {
+        for (let dx = -1; dx <= 1; dx += 1) {
+          const xx = clamp(x + dx, 0, width - 1);
+          const yy = clamp(y + dy, 0, height - 1);
+          values.push(gray[yy * width + xx]);
+        }
+      }
+      values.sort((a, b) => a - b);
+      out[y * width + x] = values[4];
+    }
+  }
+  return out;
+}
+
+function unsharp(gray, width, height, radius = 2, amount = 1.5) {
+  const blur = boxBlur(gray, width, height, radius);
+  const out = new Float32Array(gray.length);
+  for (let i = 0; i < gray.length; i += 1) {
+    out[i] = clamp(gray[i] + (gray[i] - blur[i]) * amount);
+  }
+  return out;
+}
+
+function sobelX(gray, width, height) {
+  const out = new Float32Array(gray.length);
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const i = y * width + x;
+      const gx =
+        -gray[(y - 1) * width + (x - 1)] - 2 * gray[y * width + (x - 1)] - gray[(y + 1) * width + (x - 1)] +
+        gray[(y - 1) * width + (x + 1)] + 2 * gray[y * width + (x + 1)] + gray[(y + 1) * width + (x + 1)];
+      out[i] = Math.abs(gx);
+    }
+  }
+  return out;
+}
+
+function stretch(gray, low = 0.02, high = 0.98) {
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < gray.length; i += 1) hist[clamp(Math.round(gray[i]))] += 1;
+  const total = gray.length;
+  const aT = total * low;
+  const bT = total * high;
+  let a = 0;
+  let b = 255;
+  let sum = 0;
+  for (let i = 0; i < 256; i += 1) {
+    sum += hist[i];
+    if (sum >= aT) {
+      a = i;
+      break;
+    }
+  }
+  sum = 0;
+  for (let i = 0; i < 256; i += 1) {
+    sum += hist[i];
+    if (sum >= bT) {
+      b = i;
+      break;
+    }
+  }
+  const den = Math.max(1, b - a);
+  const out = new Float32Array(gray.length);
+  for (let i = 0; i < gray.length; i += 1) {
+    out[i] = clamp(((gray[i] - a) / den) * 255);
+  }
+  return out;
+}
+
+function histogramEqualize(gray) {
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < gray.length; i += 1) hist[clamp(Math.round(gray[i]))] += 1;
+  const cdf = new Float32Array(256);
+  let sum = 0;
+  for (let i = 0; i < 256; i += 1) {
+    sum += hist[i];
+    cdf[i] = sum;
+  }
+  let cdfMin = 0;
+  for (let i = 0; i < 256; i += 1) {
+    if (cdf[i] > 0) {
+      cdfMin = cdf[i];
+      break;
+    }
+  }
+  const den = gray.length - cdfMin || 1;
+  const out = new Float32Array(gray.length);
+  for (let i = 0; i < gray.length; i += 1) {
+    const v = clamp(Math.round(gray[i]));
+    out[i] = clamp(((cdf[v] - cdfMin) / den) * 255);
+  }
+  return out;
+}
+
+function directionalSharpenVertical(gray, width, height, strength = 1.2) {
+  const out = new Float32Array(gray.length);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const l = gray[y * width + clamp(x - 1, 0, width - 1)];
+      const c = gray[y * width + x];
+      const r = gray[y * width + clamp(x + 1, 0, width - 1)];
+      out[y * width + x] = clamp(c * (1 + 2 * strength) - (l + r) * strength);
+    }
+  }
+  return out;
+}
+
+function rotateCanvas(srcCanvas, angleDeg, fill = 255) {
+  const angle = (angleDeg * Math.PI) / 180;
+  const out = createCanvas(srcCanvas.width, srcCanvas.height);
+  const ctx = out.getContext("2d", { willReadFrequently: true });
+  ctx.fillStyle = `rgb(${fill},${fill},${fill})`;
+  ctx.fillRect(0, 0, out.width, out.height);
+  ctx.translate(out.width / 2, out.height / 2);
+  ctx.rotate(angle);
+  ctx.drawImage(srcCanvas, -srcCanvas.width / 2, -srcCanvas.height / 2);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  return out;
+}
+
+function estimateBestSkewAngle(canvas) {
+  let bestAngle = 0;
+  let bestScore = -Infinity;
+  for (let angle = -12; angle <= 12; angle += 2) {
+    const rotated = rotateCanvas(canvas, angle);
+    const ctx = rotated.getContext("2d", { willReadFrequently: true });
+    const data = ctx.getImageData(0, 0, rotated.width, rotated.height);
+    const gray = grayFromImageData(data.data);
+    const edge = sobelX(gray, rotated.width, rotated.height);
+    const cols = new Float32Array(rotated.width);
+    for (let y = 0; y < rotated.height; y += 1) {
+      for (let x = 0; x < rotated.width; x += 1) {
+        cols[x] += edge[y * rotated.width + x];
+      }
+    }
+    let mean = 0;
+    for (let i = 0; i < cols.length; i += 1) mean += cols[i];
+    mean /= cols.length;
+    let variance = 0;
+    for (let i = 0; i < cols.length; i += 1) {
+      const d = cols[i] - mean;
+      variance += d * d;
+    }
+    if (variance > bestScore) {
+      bestScore = variance;
+      bestAngle = angle;
+    }
+  }
+  return bestAngle;
+}
+
+function deglare(imageData) {
+  const gray = grayFromImageData(imageData.data);
+  const smooth = boxBlur(gray, imageData.width, imageData.height, 7);
+  for (let i = 0, p = 0; i < imageData.data.length; i += 4, p += 1) {
+    const r = imageData.data[i];
+    const g = imageData.data[i + 1];
+    const b = imageData.data[i + 2];
+    const sat = Math.max(r, g, b) - Math.min(r, g, b);
+    if (gray[p] > 228 && sat < 35) {
+      const target = clamp(smooth[p] + 10);
+      imageData.data[i] = Math.min(r, target);
+      imageData.data[i + 1] = Math.min(g, target);
+      imageData.data[i + 2] = Math.min(b, target);
+    }
+  }
+  return imageData;
+}
+
+function autoCropLabel(canvas) {
+  const scale = Math.min(1, 360 / Math.max(canvas.width, canvas.height));
+  const w = Math.max(1, Math.round(canvas.width * scale));
+  const h = Math.max(1, Math.round(canvas.height * scale));
+  const down = createCanvas(w, h);
+  const ctx = down.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(canvas, 0, 0, w, h);
+
+  const data = ctx.getImageData(0, 0, w, h);
+  const gray = grayFromImageData(data.data);
+  const edge = sobelX(gray, w, h);
+  const row = new Float32Array(h);
+  const col = new Float32Array(w);
+  for (let y = 0; y < h; y += 1) {
+    for (let x = 0; x < w; x += 1) {
+      const v = edge[y * w + x];
+      row[y] += v;
+      col[x] += v;
+    }
+  }
+  const rowMax = Math.max(...row);
+  const colMax = Math.max(...col);
+  let y0 = 0;
+  let y1 = h - 1;
+  let x0 = 0;
+  let x1 = w - 1;
+  while (y0 < h - 1 && row[y0] < rowMax * 0.45) y0 += 1;
+  while (y1 > 0 && row[y1] < rowMax * 0.45) y1 -= 1;
+  while (x0 < w - 1 && col[x0] < colMax * 0.35) x0 += 1;
+  while (x1 > 0 && col[x1] < colMax * 0.35) x1 -= 1;
+
+  const padX = Math.floor((x1 - x0 + 1) * 0.08);
+  const padY = Math.floor((y1 - y0 + 1) * 0.18);
+  x0 = clamp(x0 - padX, 0, w - 1);
+  y0 = clamp(y0 - padY, 0, h - 1);
+  x1 = clamp(x1 + padX, 0, w - 1);
+  y1 = clamp(y1 + padY, 0, h - 1);
+
+  const sx = Math.floor((x0 / w) * canvas.width);
+  const sy = Math.floor((y0 / h) * canvas.height);
+  const sw = Math.max(8, Math.floor(((x1 - x0 + 1) / w) * canvas.width));
+  const sh = Math.max(8, Math.floor(((y1 - y0 + 1) / h) * canvas.height));
+  const cropped = createCanvas(sw, sh);
+  cropped.getContext("2d").drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+  return cropped;
+}
+
+function otsu(gray) {
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < gray.length; i += 1) hist[clamp(Math.round(gray[i]))] += 1;
+  let sum = 0;
+  for (let i = 0; i < 256; i += 1) sum += i * hist[i];
+  let sumB = 0;
+  let wB = 0;
+  let maxVar = 0;
+  let threshold = 127;
+  for (let i = 0; i < 256; i += 1) {
+    wB += hist[i];
+    if (!wB) continue;
+    const wF = gray.length - wB;
+    if (!wF) break;
+    sumB += i * hist[i];
+    const mB = sumB / wB;
+    const mF = (sum - sumB) / wF;
+    const v = wB * wF * (mB - mF) * (mB - mF);
+    if (v > maxVar) {
+      maxVar = v;
+      threshold = i;
+    }
+  }
+  return threshold;
+}
+
+function preprocessForScanner(sourceCanvas) {
+  const cropped = autoCropLabel(sourceCanvas);
+  const angle = estimateBestSkewAngle(cropped);
+  const straight = rotateCanvas(cropped, -angle);
+  const ctx = straight.getContext("2d", { willReadFrequently: true });
+  const imageData = deglare(ctx.getImageData(0, 0, straight.width, straight.height));
+  const base = grayFromImageData(imageData.data);
+
+  let barcode = median3x3(base, straight.width, straight.height);
+  barcode = unsharp(barcode, straight.width, straight.height, 2, 1.8);
+  barcode = directionalSharpenVertical(barcode, straight.width, straight.height, 1.2);
+  barcode = histogramEqualize(barcode);
+  barcode = stretch(barcode, 0.02, 0.98);
+
+  let ocr = median3x3(base, straight.width, straight.height);
+  ocr = unsharp(ocr, straight.width, straight.height, 1, 1.2);
+  ocr = stretch(histogramEqualize(boxBlur(ocr, straight.width, straight.height, 1)), 0.03, 0.97);
+
+  const strongContrast = unsharp(stretch(barcode, 0.01, 0.99), straight.width, straight.height, 1, 1.6);
+  const edgeBoost = stretch(sobelX(barcode, straight.width, straight.height), 0.02, 0.98);
+  const th = otsu(barcode);
+  const binary = new Float32Array(barcode.length);
+  for (let i = 0; i < barcode.length; i += 1) binary[i] = barcode[i] >= th ? 255 : 0;
+
+  return {
+    cropped,
+    versionA: grayToCanvas(barcode, straight.width, straight.height),
+    versionB: grayToCanvas(ocr, straight.width, straight.height),
+    fallbackA: grayToCanvas(strongContrast, straight.width, straight.height),
+    fallbackB: grayToCanvas(edgeBoost, straight.width, straight.height),
+    fallbackC: grayToCanvas(binary, straight.width, straight.height),
+  };
+}
+
+function canvasToBlob(canvas) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (!blob) reject(new Error("Failed to export image"));
+      else resolve(blob);
+    }, "image/png");
+  });
+}
+
 export default function App() {
   const videoRef = useRef(null);
   const readerRef = useRef(null);
@@ -87,6 +454,7 @@ export default function App() {
   const [autoCommit, setAutoCommit] = useState(true);
   const [manual, setManual] = useState("");
   const [cooldownMs, setCooldownMs] = useState(1200);
+  const [processed, setProcessed] = useState(null);
 
   const count = rows.length;
 
@@ -368,28 +736,64 @@ export default function App() {
     setStatus(`Agregado manual: ${v}`);
   }
 
+  async function tryDecodePasses(reader, passes) {
+    for (const pass of passes) {
+      try {
+        const res = await reader.decodeFromCanvas(pass.canvas);
+        const text = normalizeText(res.getText());
+        const format = res.getBarcodeFormat?.() ?? "";
+        if (isLikelyBarcode(text)) {
+          return { ok: true, text, format: String(format), pass: pass.name };
+        }
+      } catch {
+        // try next pass
+      }
+    }
+    return { ok: false };
+  }
+
   async function decodeFromImage(file) {
     setError("");
+    setStatus("Preprocesando imagen para barcode y OCR...");
     try {
       const reader = await ensureReader();
       const url = URL.createObjectURL(file);
       const img = new Image();
       img.onload = async () => {
         try {
-          const res = await reader.decodeFromImageElement(img);
-          const text = normalizeText(res.getText());
-          const format = res.getBarcodeFormat?.() ?? "";
-          if (!isLikelyBarcode(text)) {
-            setError("Leí algo, pero no parece un código válido (muy corto). Prueba otra foto.");
-            URL.revokeObjectURL(url);
+          const source = imageToCanvas(img);
+          const pack = preprocessForScanner(source);
+          const versionABlob = await canvasToBlob(pack.versionA);
+          const versionBBlob = await canvasToBlob(pack.versionB);
+
+          setProcessed({
+            cropPreview: pack.cropped.toDataURL("image/png"),
+            versionAPreview: pack.versionA.toDataURL("image/png"),
+            versionBPreview: pack.versionB.toDataURL("image/png"),
+            versionABlob,
+            versionBBlob,
+          });
+
+          const decoded = await tryDecodePasses(reader, [
+            { name: "Version A (1D optimized)", canvas: pack.versionA },
+            { name: "Version B (OCR optimized)", canvas: pack.versionB },
+            { name: "Fallback A (strong contrast)", canvas: pack.fallbackA },
+            { name: "Fallback B (edge emphasis)", canvas: pack.fallbackB },
+            { name: "Fallback C (threshold binarization)", canvas: pack.fallbackC },
+          ]);
+
+          if (!decoded.ok) {
+            setError("No pude detectar barcode tras todas las pasadas de preprocesado.");
+            setStatus("Imagen procesada. Descarga Version A/B para ZXing, QuaggaJS o Dynamsoft.");
             return;
           }
+
           setRows((prev) => [
             ...prev,
-            { _ts: Date.now(), timestamp: nowIsoLocal(), barcode: text, format: String(format) },
+            { _ts: Date.now(), timestamp: nowIsoLocal(), barcode: decoded.text, format: decoded.format },
           ]);
           beep();
-          setStatus(`Detectado desde imagen: ${text}`);
+          setStatus(`Detectado en ${decoded.pass}: ${decoded.text}`);
         } catch (e) {
           setError(`No pude leer el código desde la imagen: ${e?.message || e}`);
         } finally {
@@ -410,7 +814,7 @@ export default function App() {
     <div className="wrap">
       <header className="top">
         <div>
-          <h1>Barcode → Excel</h1>
+          <h1>Barcode to Excel</h1>
           <div className="sub">Escanea con la cámara y exporta a .xlsx (sin servidor). Robusto con “Deep Scan”.</div>
         </div>
         <div className="right">
@@ -427,15 +831,15 @@ export default function App() {
           </div>
 
           <div className="controls">
-            <button className="btn" onClick={() => startCamera({ attempt: 1 })}>▶ Iniciar</button>
-            <button className="btn ghost" onClick={stopCamera}>⏹ Detener</button>
-            <button className="btn ghost" onClick={refreshDevices}>↻ Cámaras</button>
+            <button className="btn" onClick={() => startCamera({ attempt: 1 })}>Iniciar</button>
+            <button className="btn ghost" onClick={stopCamera}>Detener</button>
+            <button className="btn ghost" onClick={refreshDevices}>Camaras</button>
           </div>
 
           <div className="row">
             <label className="label">Modo</label>
             <select className="input" value={scanMode} onChange={(e) => setScanMode(e.target.value)}>
-              <option value="deep">Deep Scan (reintentos 1→4)</option>
+              <option value="deep">Deep Scan (reintentos 1-4)</option>
               <option value="fast">Fast (sin watchdog)</option>
             </select>
           </div>
@@ -476,7 +880,7 @@ export default function App() {
           <div className="row">
             <label className="label">Linterna (si tu móvil lo soporta)</label>
             <button className="btn" onClick={toggleTorch} disabled={!torchSupported}>
-              {torchOn ? "💡 Apagar" : "🔦 Encender"}
+              {torchOn ? "Apagar" : "Encender"}
             </button>
             {!torchSupported && <div className="muted">(no disponible)</div>}
           </div>
@@ -502,7 +906,7 @@ export default function App() {
                   if (e.key === "Enter") commitManual();
                 }}
               />
-              <button className="btn" onClick={commitManual}>➕ Añadir</button>
+              <button className="btn" onClick={commitManual}>Anadir</button>
             </div>
           </div>
 
@@ -521,6 +925,34 @@ export default function App() {
             <div className="muted">Tip: foto bien enfocada, sin reflejos.</div>
           </div>
 
+          {processed && (
+            <div className="processedBlock">
+              <div className="muted">Resultado de preprocesado listo para scanner automatico</div>
+              <div className="processedGrid">
+                <figure>
+                  <figcaption>ROI recortado automaticamente</figcaption>
+                  <img src={processed.cropPreview} alt="ROI" />
+                </figure>
+                <figure>
+                  <figcaption>Version A: 1D barcode</figcaption>
+                  <img src={processed.versionAPreview} alt="Version A" />
+                </figure>
+                <figure>
+                  <figcaption>Version B: OCR</figcaption>
+                  <img src={processed.versionBPreview} alt="Version B" />
+                </figure>
+              </div>
+              <div className="controls">
+                <button className="btn" onClick={() => saveAs(processed.versionABlob, "processed-barcode-vA.png")}>
+                  Descargar Version A
+                </button>
+                <button className="btn" onClick={() => saveAs(processed.versionBBlob, "processed-ocr-vB.png")}>
+                  Descargar Version B
+                </button>
+              </div>
+            </div>
+          )}
+
         </div>
 
         <div className="card">
@@ -530,7 +962,7 @@ export default function App() {
           </div>
 
           <div className="tableActions">
-            <button className="btn ghost" onClick={clearAll} disabled={rows.length === 0}>🧹 Borrar todo</button>
+            <button className="btn ghost" onClick={clearAll} disabled={rows.length === 0}>Borrar todo</button>
           </div>
 
           <div className="tableWrap">
@@ -569,9 +1001,10 @@ export default function App() {
 
       <footer className="foot">
         <div className="muted">
-          Deep Scan hace reintentos automáticos (hasta 4) si no detecta nada: resolución↑ → cambio de cámara → reinicio lector.
+          Deep Scan hace reintentos automaticos (hasta 4) si no detecta nada: resolucion, cambio de camara y reinicio lector.
         </div>
       </footer>
     </div>
   );
 }
+
