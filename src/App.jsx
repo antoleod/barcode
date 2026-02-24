@@ -876,6 +876,36 @@ export default function App() {
     setStatus("Historial borrado.");
   }
 
+  async function clearAppCache() {
+    const ok = confirm("Clear this app cache and local app data?");
+    if (!ok) return;
+
+    try {
+      localStorage.removeItem(LS_KEY);
+      Object.keys(localStorage).forEach((k) => {
+        if (/^barcode/i.test(k)) localStorage.removeItem(k);
+      });
+      Object.keys(sessionStorage).forEach((k) => {
+        if (/^barcode/i.test(k)) sessionStorage.removeItem(k);
+      });
+
+      if ("caches" in window) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map((k) => caches.delete(k)));
+      }
+
+      setRows([]);
+      setProcessed(null);
+      setSerialLocked(false);
+      setStatus("App cache cleared. Reloading...");
+
+      const nextUrl = `${window.location.pathname}?v=${Date.now()}`;
+      window.location.replace(nextUrl);
+    } catch (e) {
+      setError(`Failed to clear app cache: ${e?.message || e}`);
+    }
+  }
+
   function commitManual() {
     const serial = extractSerialFromText(manual);
     if (!serial) {
@@ -1103,6 +1133,7 @@ export default function App() {
         </div>
         <div className="right">
           <div className="pill">Total: <strong>{count}</strong></div>
+          <button className="btn ghost" onClick={clearAppCache}>Clear app cache</button>
           <button className="btn" onClick={exportXlsx} disabled={rows.length === 0}>Exportar Excel</button>
         </div>
       </header>
