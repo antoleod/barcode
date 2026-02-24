@@ -1,5 +1,5 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import { BrowserMultiFormatReader, BarcodeFormat, DecodeHintType } from "@zxing/browser";
+﻿import React, { useEffect, useMemo, useRef, useState } from "react";
+import { BrowserMultiFormatReader } from "@zxing/browser";
 import Quagga from "@ericblade/quagga2";
 import { saveAs } from "file-saver";
 import Tesseract from "tesseract.js";
@@ -61,21 +61,6 @@ function saveRows(rows) {
 
 function normalizeText(txt) {
   return String(txt ?? "").trim();
-}
-
-function isLikelyBarcode(value) {
-  // barcode can be numeric/alphanum; we only filter out super short noise
-  const v = normalizeText(value);
-  return v.length >= 5; // conservative
-}
-
-function uniqueByRecent(rows, newValue, windowMs = 1200) {
-  const v = normalizeText(newValue);
-  const last = rows[0];
-  if (!last) return true;
-  if (normalizeText(last.barcode) !== v) return true;
-  const lastT = Number(last._ts || 0);
-  return Date.now() - lastT > windowMs;
 }
 
 function clamp(value, min = 0, max = 255) {
@@ -479,6 +464,78 @@ function calculateFrameDiff(dataA, dataB) {
   return diff / (dataA.length / 4);
 }
 
+function extractSerialFromText(text) {
+  const cleaned = (text || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+
+  const matches = cleaned.match(/02PI20[A-Z0-9]+/g);
+  if (!matches || matches.length === 0) return null;
+
+  matches.sort((a, b) => b.length - a.length);
+  return matches[0];
+}
+
+function getBBoxFromZXingResult(resultPoints) {
+  if (!resultPoints || resultPoints.length === 0) return null;
+  const xs = resultPoints.map((p) => p.getX?.() ?? p.x).filter((v) => Number.isFinite(v));
+  const ys = resultPoints.map((p) => p.getY?.() ?? p.y).filter((v) => Number.isFinite(v));
+  if (xs.length === 0 || ys.length === 0) return null;
+
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+
+  return {
+    x: Math.max(0, Math.floor(minX)),
+    y: Math.max(0, Math.floor(minY)),
+    width: Math.max(8, Math.ceil(maxX - minX)),
+    height: Math.max(8, Math.ceil(maxY - minY)),
+  };
+}
+
+function expandBBox(bbox, expandDown = 0.2, expandX = 0.08) {
+  const growX = bbox.width * expandX;
+  return {
+    x: bbox.x - growX,
+    y: bbox.y,
+    width: bbox.width + growX * 2,
+    height: bbox.height * (1 + expandDown),
+  };
+}
+
+function cropCanvas(sourceCanvas, bbox) {
+  const x = clamp(Math.floor(bbox.x), 0, sourceCanvas.width - 1);
+  const y = clamp(Math.floor(bbox.y), 0, sourceCanvas.height - 1);
+  const maxW = sourceCanvas.width - x;
+  const maxH = sourceCanvas.height - y;
+  const width = clamp(Math.floor(bbox.width), 1, maxW);
+  const height = clamp(Math.floor(bbox.height), 1, maxH);
+  const canvas = createCanvas(width, height);
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(sourceCanvas, x, y, width, height, 0, 0, width, height);
+  return canvas;
+}
+
+function preprocessRoiCanvas(roiCanvas) {
+  const out = createCanvas(roiCanvas.width, roiCanvas.height);
+  const ctx = out.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(roiCanvas, 0, 0);
+  const img = ctx.getImageData(0, 0, out.width, out.height);
+  const gray = grayFromImageData(img.data);
+  const th = otsu(gray);
+  for (let i = 0; i < gray.length; i += 1) {
+    const v = gray[i] >= th ? 255 : 0;
+    img.data[i * 4] = v;
+    img.data[i * 4 + 1] = v;
+    img.data[i * 4 + 2] = v;
+    img.data[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  return out;
+}
+
 export default function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null); // Internal canvas for processing
@@ -487,7 +544,7 @@ export default function App() {
   const workerPromiseRef = useRef(null);
 
   const [rows, setRows] = useState(() => loadRows());
-  const [status, setStatus] = useState("Listo. Dale permiso a la cámara y escanea.");
+  const [status, setStatus] = useState("Listo. Dale permiso a la cÃ¡mara y escanea.");
   const [error, setError] = useState("");
   const [devices, setDevices] = useState([]);
   const [deviceId, setDeviceId] = useState("");
@@ -503,6 +560,7 @@ export default function App() {
   const [scanning, setScanning] = useState(false);
   const [scanPhase, setScanPhase] = useState(0); // 0: Normal, 1: Focus/Res, 2: Preprocess, 3: Deep
   const [roiStyle, setRoiStyle] = useState({});
+  const [serialLocked, setSerialLocked] = useState(false);
 
   const count = rows.length;
 
@@ -512,23 +570,10 @@ export default function App() {
 
   const orderedRows = useMemo(() => [...rows].reverse(), [rows]);
 
-  // Initialize ZXing Reader with Hints
+  // Initialize ZXing Reader
   const getReader = () => {
     if (!readerRef.current) {
-      const hints = new Map();
-      const formats = [
-        BarcodeFormat.CODE_128,
-        BarcodeFormat.CODE_39,
-        BarcodeFormat.EAN_13,
-        BarcodeFormat.EAN_8,
-        BarcodeFormat.ITF,
-        BarcodeFormat.UPC_A,
-        BarcodeFormat.UPC_E,
-        BarcodeFormat.CODABAR
-      ];
-      hints.set(DecodeHintType.POSSIBLE_FORMATS, formats);
-      hints.set(DecodeHintType.TRY_HARDER, true);
-      readerRef.current = new BrowserMultiFormatReader(hints);
+      readerRef.current = new BrowserMultiFormatReader();
     }
     return readerRef.current;
   };
@@ -545,7 +590,7 @@ export default function App() {
         setDeviceId((back || list[0] || {}).deviceId || "");
       }
     } catch (e) {
-      setError(`No pude listar cámaras: ${e?.message || e}`);
+      setError(`No pude listar cÃ¡maras: ${e?.message || e}`);
     }
   }
 
@@ -563,7 +608,8 @@ export default function App() {
     phaseStartTime: 0,
     stream: null,
     track: null,
-    ocrBusy: false
+    ocrBusy: false,
+    lastOcrTime: 0
   });
 
   async function stopCamera() {
@@ -584,7 +630,8 @@ export default function App() {
   async function startCamera() {
     await stopCamera();
     setError("");
-    setStatus("Iniciando cámara...");
+    setStatus("Iniciando cÃ¡mara...");
+    setSerialLocked(false);
     setScanning(true);
     scanState.current.active = true;
     scanState.current.phaseStartTime = Date.now();
@@ -628,10 +675,10 @@ export default function App() {
         }
       }
 
-      setStatus("Buscando código...");
+      setStatus("Buscando cÃ³digo...");
     } catch (e) {
       console.error(e);
-      setError("Error al acceder a la cámara. Verifica permisos.");
+      setError("Error al acceder a la cÃ¡mara. Verifica permisos.");
       setScanning(false);
     }
   }
@@ -697,6 +744,7 @@ export default function App() {
 
   async function attemptDecode(canvas, ctx) {
     const now = Date.now();
+    if (serialLocked) return;
     // Debounce scans
     if (now - scanState.current.lastScanTime < 100) return; 
     scanState.current.lastScanTime = now;
@@ -713,117 +761,20 @@ export default function App() {
       setScanPhase(phase);
       if (phase === 1) setStatus("Enfocando...");
       if (phase === 2) setStatus("Ajustando contraste...");
-      if (phase === 3) setStatus("Probando inversión y filtros...");
-      if (phase === 4) setStatus("Intentando leer números (OCR)...");
+      if (phase === 3) setStatus("Probando inversiÃ³n y filtros...");
+      if (phase === 4) setStatus("Intentando leer nÃºmeros (OCR)...");
     }
 
-    // --- Pipeline ---
-
-    // 1. Primary: ZXing (Fastest)
-    try {
-      const reader = getReader();
-      // We use decodeFromCanvas which is synchronous-ish wrapper in zxing-browser but actually heavy
-      // To avoid blocking UI too much, we rely on the loop interval
-      const result = await reader.decodeFromCanvas(canvas);
-      if (result) {
-        handleScanSuccess(result.getText(), result.getBarcodeFormat());
-        return;
-      }
-    } catch {
-      // ZXing failed
-    }
-
-    // 2. Secondary: Quagga (Robust for some 1D)
-    // Only run Quagga every few frames or if Phase > 0 to save CPU
-    if (phase > 0 || (scanState.current.consecutiveStableFrames % 3 === 0)) {
-      try {
-        await new Promise((resolve, reject) => {
-          Quagga.decodeSingle({
-            src: canvas.toDataURL("image/jpeg"), // Quagga needs base64 or element
-            numOfWorkers: 0, // Main thread to avoid worker overhead for single check
-            inputStream: { size: canvas.width },
-            decoder: { readers: ["code_128_reader", "ean_reader", "code_39_reader", "i2of5_reader"] },
-          }, (res) => {
-            if (res && res.codeResult && res.codeResult.code) {
-              handleScanSuccess(res.codeResult.code, res.codeResult.format);
-              resolve();
-            } else {
-              reject();
-            }
-          });
-        });
-        return;
-      } catch {
-        // Quagga failed
-      }
-    }
-
-    // 3. Preprocessing (Phase 2+)
-    if (phase >= 2) {
-      // Apply contrast/grayscale in place on canvas context
-      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const gray = grayFromImageData(imgData.data);
-      // Simple contrast stretch
-      const stretched = stretch(gray, 0.05, 0.95);
-      // Put back
-      for (let i = 0; i < stretched.length; i++) {
-        const v = stretched[i];
-        imgData.data[i*4] = v;
-        imgData.data[i*4+1] = v;
-        imgData.data[i*4+2] = v;
-      }
-      ctx.putImageData(imgData, 0, 0);
-      
-      // Retry ZXing on processed frame
-      try {
-        const reader = getReader();
-        const result = await reader.decodeFromCanvas(canvas);
-        if (result) {
-          handleScanSuccess(result.getText(), result.getBarcodeFormat());
-          return;
-        }
-      } catch {}
-    }
-
-    // 4. Deep Scan (Phase 3+) - Binarization
-    if (phase >= 3) {
-      binarizeCanvas(canvas); // Otsu thresholding
-      try {
-        const reader = getReader();
-        const result = await reader.decodeFromCanvas(canvas);
-        if (result) {
-          handleScanSuccess(result.getText(), result.getBarcodeFormat());
-          return;
-        }
-      } catch {}
-    }
-
-    // 5. Deep Scan (Phase 3) - Inversion (Negative)
-    if (phase >= 3) {
-      // Invert colors in place
-      invertCanvas(canvas);
-      try {
-        const reader = getReader();
-        const result = await reader.decodeFromCanvas(canvas);
-        if (result) {
-          handleScanSuccess(result.getText(), result.getBarcodeFormat());
-          return;
-        }
-      } catch {}
-      // Revert inversion for next steps if any (though we redraw next frame anyway)
-      invertCanvas(canvas); 
-    }
-
-    // 6. OCR Fallback (Phase 4) - Read Numbers
-    // Only run if not busy and throttled (every ~2s)
-    if (phase >= 4 && !scanState.current.ocrBusy && (now - scanState.current.lastOcrTime > 2000 || !scanState.current.lastOcrTime)) {
+    // OCR only on ROI under barcode bbox (no full-frame OCR)
+    if (phase >= 4 && !scanState.current.ocrBusy && (now - scanState.current.lastOcrTime > 1800 || !scanState.current.lastOcrTime)) {
       scanState.current.ocrBusy = true;
       scanState.current.lastOcrTime = now;
       
-      tryOcr(canvas)
+      detectBarcodeBBoxFromCanvas(canvas)
+        .then((bbox) => tryOcrSerialFromRoi(canvas, bbox))
         .then((res) => {
-          if (res.ok) {
-            handleScanSuccess(res.text, res.format);
+          if (res.success && res.serial) {
+            saveSerial(res.serial);
           }
         })
         .catch(err => console.warn("OCR error", err))
@@ -838,37 +789,16 @@ export default function App() {
     }
   }
 
-  function handleScanSuccess(text, format) {
-    const cleanText = normalizeText(text);
-    if (!isLikelyBarcode(cleanText)) return;
+  function hasSerial(serial) {
+    return rows.some((r) => normalizeText(r.serial) === normalizeText(serial));
+  }
 
-    // Debounce duplicate scans
-    if (!uniqueByRecent(rows, cleanText, cooldownMs)) {
-      // Visual feedback for duplicate scan?
-      return;
-    }
-
+  function saveSerial(serial) {
+    if (!serial || hasSerial(serial)) return;
     playSuccessSound();
-    setRows(prev => [
-      ...prev,
-      { _ts: Date.now(), timestamp: nowIsoLocal(), barcode: cleanText, format: String(format) }
-    ]);
-    setStatus(`Detectado: ${cleanText}`);
-    
-    // Reset phase on success
-    scanState.current.phaseStartTime = Date.now();
-    setScanPhase(0);
-    
-    // Visual flash effect on ROI
-    const roi = document.getElementById("scanner-roi");
-    if (roi) {
-      roi.style.borderColor = "#4ade80";
-      roi.style.boxShadow = "0 0 20px #4ade80";
-      setTimeout(() => {
-        roi.style.borderColor = "rgba(255, 255, 255, 0.8)";
-        roi.style.boxShadow = "0 0 0 9999px rgba(0, 0, 0, 0.5)";
-      }, 300);
-    }
+    setRows((prev) => [...prev, { _ts: Date.now(), timestamp: nowIsoLocal(), serial }]);
+    setStatus(`Serial detectado: ${serial}`);
+    setSerialLocked(true);
   }
 
   useEffect(() => {
@@ -896,8 +826,7 @@ export default function App() {
     const data = rows.map((r, idx) => ({
       "#": idx + 1,
       Timestamp: r.timestamp,
-      Barcode: r.barcode,
-      Format: r.format,
+      Serial: r.serial,
     }));
 
     const ws = XLSX.utils.json_to_sheet(data);
@@ -908,8 +837,7 @@ export default function App() {
     ws["!cols"] = [
       { wch: 6 },
       { wch: 20 },
-      { wch: 26 },
-      { wch: 14 },
+      { wch: 30 },
     ];
 
     const bytes = XLSX.write(wb, { bookType: "xlsx", type: "array" });
@@ -922,41 +850,22 @@ export default function App() {
   }
 
   function clearAll() {
-    if (!confirm("¿Seguro que quieres borrar todo el historial?") ) return;
+    if (!confirm("Â¿Seguro que quieres borrar todo el historial?") ) return;
     setRows([]);
     saveRows([]);
+    setSerialLocked(false);
     setStatus("Historial borrado.");
   }
 
   function commitManual() {
-    const v = normalizeText(manual);
-    if (!isLikelyBarcode(v)) {
-      setError("Código muy corto. Intenta de nuevo.");
+    const serial = extractSerialFromText(manual);
+    if (!serial) {
+      setError("Serial invalido. Debe empezar por 02PI20.");
       return;
     }
-    setRows((prev) => [
-      ...prev,
-      { _ts: Date.now(), timestamp: nowIsoLocal(), barcode: v, format: "MANUAL" },
-    ]);
+    if (hasSerial(serial)) return;
+    saveSerial(serial);
     setManual("");
-    playSuccessSound();
-    setStatus(`Agregado manual: ${v}`);
-  }
-
-  async function tryDecodePasses(reader, passes) {
-    for (const pass of passes) {
-      try {
-        const res = await reader.decodeFromCanvas(pass.canvas);
-        const text = normalizeText(res.getText());
-        const format = res.getBarcodeFormat?.() ?? "";
-        if (isLikelyBarcode(text)) {
-          return { ok: true, text, format: String(format), pass: pass.name };
-        }
-      } catch {
-        // try next pass
-      }
-    }
-    return { ok: false };
   }
 
   async function getOcrWorker() {
@@ -966,7 +875,7 @@ export default function App() {
     workerPromiseRef.current = (async () => {
       const w = await Tesseract.createWorker("eng");
       await w.setParameters({
-        tessedit_char_whitelist: "0123456789",
+        tessedit_char_whitelist: "02PI20ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
       });
       workerRef.current = w;
       workerPromiseRef.current = null;
@@ -975,20 +884,103 @@ export default function App() {
     return workerPromiseRef.current;
   }
 
-  async function tryOcr(canvas) {
-    try {
-      const worker = await getOcrWorker();
-      const { data: { text } } = await worker.recognize(canvas);
+  function getCenteredFallbackBBox(canvas) {
+    const w = canvas.width * 0.7;
+    const h = canvas.height * 0.2;
+    return {
+      x: (canvas.width - w) / 2,
+      y: canvas.height * 0.58,
+      width: w,
+      height: h,
+    };
+  }
 
-      const matches = text.match(/\b\d{5,}\b/g);
-      if (matches && matches.length > 0) {
-        const best = matches.sort((a, b) => b.length - a.length)[0];
-        return { ok: true, text: best, format: "OCR_TEXT", pass: "OCR" };
-      }
-    } catch (e) {
-      console.warn("OCR error", e);
+  function buildSerialRoiBBox(baseBbox, canvas) {
+    const below = {
+      x: baseBbox.x,
+      y: baseBbox.y + baseBbox.height,
+      width: baseBbox.width,
+      height: Math.max(20, baseBbox.height * 0.95),
+    };
+    const expanded = expandBBox(below, 0.2, 0.08);
+    return {
+      x: clamp(expanded.x, 0, canvas.width - 1),
+      y: clamp(expanded.y, 0, canvas.height - 1),
+      width: clamp(expanded.width, 1, canvas.width - clamp(expanded.x, 0, canvas.width - 1)),
+      height: clamp(expanded.height, 1, canvas.height - clamp(expanded.y, 0, canvas.height - 1)),
+    };
+  }
+
+  async function detectBarcodeBBoxFromCanvas(frameCanvas) {
+    try {
+      const result = await getReader().decodeFromCanvas(frameCanvas);
+      const bbox = getBBoxFromZXingResult(result?.getResultPoints?.());
+      if (bbox) return bbox;
+    } catch {
+      // fallback to quagga
     }
-    return { ok: false };
+
+    try {
+      const quaggaResult = await new Promise((resolve) => {
+        Quagga.decodeSingle(
+          {
+            src: frameCanvas.toDataURL("image/jpeg"),
+            numOfWorkers: 0,
+            locate: true,
+            decoder: { readers: ["code_128_reader", "ean_reader", "code_39_reader", "i2of5_reader"] },
+          },
+          (res) => resolve(res || null)
+        );
+      });
+
+      if (quaggaResult?.box?.length) {
+        const xs = quaggaResult.box.map((p) => p.x);
+        const ys = quaggaResult.box.map((p) => p.y);
+        return {
+          x: Math.min(...xs),
+          y: Math.min(...ys),
+          width: Math.max(...xs) - Math.min(...xs),
+          height: Math.max(...ys) - Math.min(...ys),
+        };
+      }
+    } catch {
+      // ignore and use centered fallback
+    }
+
+    return getCenteredFallbackBBox(frameCanvas);
+  }
+
+  async function tryOcrSerialFromRoi(frameCanvas, bbox) {
+    const resultBase = {
+      success: false,
+      serial: null,
+      method: "fail",
+      error: null,
+    };
+
+    try {
+      const roiBbox = buildSerialRoiBBox(bbox, frameCanvas);
+      const roiCanvas = cropCanvas(frameCanvas, roiBbox);
+      const pre = preprocessRoiCanvas(roiCanvas);
+      const worker = await getOcrWorker();
+
+      const first = await worker.recognize(pre);
+      let serial = extractSerialFromText(first?.data?.text);
+      if (serial) {
+        return { success: true, serial, method: "ocr-roi", error: null };
+      }
+
+      invertCanvas(pre);
+      const second = await worker.recognize(pre);
+      serial = extractSerialFromText(second?.data?.text);
+      if (serial) {
+        return { success: true, serial, method: "ocr-roi", error: null };
+      }
+
+      return { ...resultBase, error: "serial_not_found" };
+    } catch (e) {
+      return { ...resultBase, error: e?.message || "ocr_error" };
+    }
   }
 
   async function decodeFromImage(file) {
@@ -1001,47 +993,28 @@ export default function App() {
       img.onload = async () => {
         try {
           const source = imageToCanvas(img);
-          const pack = preprocessForScanner(source);
-          const versionABlob = await canvasToBlob(pack.versionA);
-          const versionBBlob = await canvasToBlob(pack.versionB);
+          const bbox = await detectBarcodeBBoxFromCanvas(source);
+          const ocrResult = await tryOcrSerialFromRoi(source, bbox);
 
+          const roiPreview = cropCanvas(source, buildSerialRoiBBox(bbox, source));
+          const roiBlob = await canvasToBlob(roiPreview);
           setProcessed({
-            cropPreview: pack.cropped.toDataURL("image/png"),
-            versionAPreview: pack.versionA.toDataURL("image/png"),
-            versionBPreview: pack.versionB.toDataURL("image/png"),
-            versionABlob,
-            versionBBlob,
+            cropPreview: roiPreview.toDataURL("image/png"),
+            versionAPreview: roiPreview.toDataURL("image/png"),
+            versionBPreview: roiPreview.toDataURL("image/png"),
+            versionABlob: roiBlob,
+            versionBBlob: roiBlob,
           });
 
-          const decoded = await tryDecodePasses(reader, [
-            { name: "Version A (1D optimized)", canvas: pack.versionA },
-            { name: "Version B (OCR optimized)", canvas: pack.versionB },
-            { name: "Fallback A (strong contrast)", canvas: pack.fallbackA },
-            { name: "Fallback B (edge emphasis)", canvas: pack.fallbackB },
-            { name: "Fallback C (threshold binarization)", canvas: pack.fallbackC },
-          ]);
-
-          if (!decoded.ok) {
-            setStatus("Barcode falló. Intentando leer números (OCR)...");
-            // Try OCR on the cleanest version (Version B)
-            const ocrResult = await tryOcr(pack.versionB);
-            if (ocrResult.ok) Object.assign(decoded, ocrResult);
-          }
-
-          if (!decoded.ok) {
-            setError("No pude detectar barcode tras todas las pasadas de preprocesado.");
-            setStatus("Imagen procesada. Descarga Version A/B para ZXing, QuaggaJS o Dynamsoft.");
+          if (!ocrResult.success || !ocrResult.serial) {
+            setError("No se encontro serial valido con prefijo 02PI20.");
+            setStatus("Fail: OCR ROI no encontro serial.");
             return;
           }
 
-          setRows((prev) => [
-            ...prev,
-            { _ts: Date.now(), timestamp: nowIsoLocal(), barcode: decoded.text, format: decoded.format },
-          ]);
-          playSuccessSound();
-          setStatus(`Detectado en ${decoded.pass}: ${decoded.text}`);
+          saveSerial(ocrResult.serial);
         } catch (e) {
-          setError(`No pude leer el código desde la imagen: ${e?.message || e}`);
+          setError(`No pude leer el cÃ³digo desde la imagen: ${e?.message || e}`);
         } finally {
           URL.revokeObjectURL(url);
         }
@@ -1103,7 +1076,7 @@ export default function App() {
 
           <div style={{ textAlign: 'center', marginTop: '1rem' }}>
             <button className="btn ghost small" style={{ fontSize: '0.85rem', padding: '4px 8px' }} onClick={() => setShowSettings(!showSettings)}>
-              {showSettings ? "Ocultar Configuración" : "Configuración (Cámara / Modo)"}
+              {showSettings ? "Ocultar ConfiguraciÃ³n" : "ConfiguraciÃ³n (CÃ¡mara / Modo)"}
             </button>
           </div>
 
@@ -1118,14 +1091,14 @@ export default function App() {
               </div>
 
               <div className="row">
-                <label className="label">Cámara</label>
+                <label className="label">CÃ¡mara</label>
                 <select className="input" value={deviceId} onChange={(e) => setDeviceId(e.target.value)}>
                   {devices.length === 0 ? (
                     <option value="">(no detectada)</option>
                   ) : (
                     devices.map((d) => (
                       <option key={d.deviceId} value={d.deviceId}>
-                        {d.label || `Camera ${d.deviceId.slice(0, 6)}…`}
+                        {d.label || `Camera ${d.deviceId.slice(0, 6)}â€¦`}
                       </option>
                     ))
                   )}
@@ -1177,7 +1150,7 @@ export default function App() {
               <input
                 className="input"
                 value={manual}
-                placeholder="Código..."
+                placeholder="CÃ³digo..."
                 onChange={(e) => setManual(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") commitManual();
@@ -1228,6 +1201,7 @@ export default function App() {
                 </button>
               </div>
             </div>
+          )}
             </div>
           )}
 
@@ -1236,7 +1210,7 @@ export default function App() {
         <div className="card">
           <div className="cardHead">
             <h2>Tabla</h2>
-            <div className="muted">Cada lectura agrega una línea nueva. Se guarda localmente.</div>
+            <div className="muted">Cada lectura agrega una lÃ­nea nueva. Se guarda localmente.</div>
           </div>
 
           <div className="tableActions">
@@ -1249,20 +1223,18 @@ export default function App() {
                 <tr>
                   <th>#</th>
                   <th>Timestamp</th>
-                  <th>Barcode</th>
-                  <th>Format</th>
+                  <th>Serial</th>
                 </tr>
               </thead>
               <tbody>
                 {orderedRows.length === 0 ? (
-                  <tr><td colSpan="4" className="muted">No hay lecturas aún.</td></tr>
+                  <tr><td colSpan="3" className="muted">No hay lecturas aÃºn.</td></tr>
                 ) : (
                   orderedRows.map((r, i) => (
                     <tr key={`${r._ts}-${i}`}>
                       <td>{orderedRows.length - i}</td>
                       <td className="mono">{r.timestamp}</td>
-                      <td className="mono">{r.barcode}</td>
-                      <td className="mono">{r.format}</td>
+                      <td className="mono">{r.serial}</td>
                     </tr>
                   ))
                 )}
@@ -1271,7 +1243,7 @@ export default function App() {
           </div>
 
           <div className="note">
-            <strong>Excel:</strong> Exporta un .xlsx listo. Si quieres “llenar un Excel existente”, puedes importar una plantilla
+            <strong>Excel:</strong> Exporta un .xlsx listo. Si quieres â€œllenar un Excel existenteâ€, puedes importar una plantilla
             y exportar de nuevo (lo dejo listo para ampliar en <code>exportXlsx()</code>).
           </div>
         </div>
