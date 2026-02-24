@@ -1,5 +1,5 @@
 
-https://oryxen.tech/barcode-excel-scanner/
+https://oryxen.tech/barcode/
 # Barcode → Excel (React)
 
 Un escáner de códigos de barras con cámara (móvil/PC) que agrega automáticamente cada lectura como una nueva fila y permite exportar a Excel (.xlsx).
